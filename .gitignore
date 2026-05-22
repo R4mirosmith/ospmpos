@@ -1,0 +1,5 @@
+# Dependencias Node
+node_modules/
+
+# Archivos subidos
+uploads/

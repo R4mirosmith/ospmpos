@@ -1,0 +1,12 @@
+const router = require('express').Router();
+const { asyncHandler } = require('../utils/asyncHandler');
+const { requireAuth, requireRoles } = require('../middleware/authJwt');
+const ctl = require('../controllers/admin.controller');
+router.use(requireAuth, requireRoles('ADMIN'));
+router.get('/empresas', asyncHandler(ctl.listarEmpresas));
+router.post('/empresas', asyncHandler(ctl.crearEmpresa));
+router.patch('/empresas/:id', asyncHandler(ctl.actualizarEmpresa));
+router.get('/sedes', asyncHandler(ctl.listarSedes));
+router.post('/sedes', asyncHandler(ctl.crearSede));
+router.patch('/sedes/:id', asyncHandler(ctl.actualizarSede));
+module.exports = router;

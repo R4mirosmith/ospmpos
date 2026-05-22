@@ -1,0 +1,2 @@
+const router=require('express').Router(); const {asyncHandler}=require('../utils/asyncHandler'); const {requireAuth,requireRoles}=require('../middleware/authJwt'); const ctl=require('../controllers/inventario.controller');
+router.use(requireAuth); router.post('/ajuste',requireRoles('ADMIN','VENDEDOR'),asyncHandler(ctl.ajuste)); router.post('/stock-inicial',requireRoles('ADMIN','VENDEDOR'),asyncHandler(ctl.stockInicial)); router.get('/stock',asyncHandler(ctl.stockList)); router.get('/kardex',asyncHandler(ctl.kardex)); module.exports=router;

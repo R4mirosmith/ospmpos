@@ -1,0 +1,2 @@
+const router=require('express').Router(); const {asyncHandler}=require('../utils/asyncHandler'); const {requireAuth,requireRoles}=require('../middleware/authJwt'); const ctl=require('../controllers/usuario_tipos.controller');
+router.use(requireAuth); router.get('/',asyncHandler(ctl.listar)); router.post('/',requireRoles('ADMIN'),asyncHandler(ctl.crear)); router.patch('/:id/estado',requireRoles('ADMIN'),asyncHandler(ctl.estado)); module.exports=router;
