@@ -1,11 +1,34 @@
 const path = require('path');
+const fs = require('fs');
 const { pool, pageLimit } = require('../utils/sql');
-const { ok, created, badRequest } = require('../utils/http');
+const { ok, created, badRequest, notFound } = require('../utils/http');
 const { writeScope, addScopeWhere, clean, toInt } = require('../utils/scope');
 const config = require('../config');
 
 function stockExpr(alias = 'p') {
   return `(SELECT COALESCE(SUM(m.cantidad),0) FROM inv_movimiento m WHERE m.producto_id=${alias}.id AND m.sede_id=${alias}.sede_id AND m.activo=1)`;
+}
+
+async function productoEnScope(req, productoId) {
+  const scope = addScopeWhere(req, 'p');
+  const [rows] = await pool.query(
+    `SELECT p.id, p.sede_id, p.empresa_id FROM producto p WHERE p.id=? ${scope.where.length ? 'AND ' + scope.where.join(' AND ') : ''} LIMIT 1`,
+    [Number(productoId), ...scope.params]
+  );
+  return rows[0] || null;
+}
+
+async function imagenEnScope(req, imagenId) {
+  const scope = addScopeWhere(req, 'p');
+  const [rows] = await pool.query(
+    `SELECT pi.id, pi.producto_id
+       FROM producto_imagen pi
+       JOIN producto p ON p.id = pi.producto_id
+      WHERE pi.id=? ${scope.where.length ? 'AND ' + scope.where.join(' AND ') : ''}
+      LIMIT 1`,
+    [Number(imagenId), ...scope.params]
+  );
+  return rows[0] || null;
 }
 async function listar(req, res) {
   const { limit, offset } = pageLimit(req.query.page, req.query.pageSize);
@@ -55,12 +78,31 @@ async function crear(req, res) {
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
+
+    const precioValor = Number(precio || 0);
+    const precioMValor = precio_m === null || precio_m === undefined || precio_m === '' ? null : Number(precio_m);
+    const stockMinimoValor = Number(stock_minimo || 0);
+    const valoresValidos = [cost, precioValor, stockMinimoValor, ...(precioMValor === null ? [] : [precioMValor])].every(Number.isFinite);
+    if (!valoresValidos || cost < 0 || precioValor < 0 || stockMinimoValor < 0 || (precioMValor !== null && precioMValor < 0)) {
+      throw Object.assign(new Error('Costo, precios y stock mínimo deben ser valores válidos no negativos'), { httpStatus: 400, code: 'VALORES_PRODUCTO_INVALIDOS' });
+    }
+    const [[categoria]] = await conn.query(
+      `SELECT id FROM categoria WHERE id=? AND sede_id=? AND activo=1 LIMIT 1`,
+      [categoria_id, s.sede_id]
+    );
+    if (!categoria) {
+      throw Object.assign(new Error('La categoría no pertenece a la sede activa o está inactiva'), { httpStatus: 400, code: 'CATEGORIA_INVALIDA' });
+    }
+
     const [r] = await conn.query(
       `INSERT INTO producto(empresa_id,sede_id,categoria_id,codigo,nombre,descripcion,garantia_info,costo,precio,precio_m,stock_minimo,activo,codigo_barras,fecha)
        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,UTC_TIMESTAMP())`,
-      [s.empresa_id, s.sede_id, categoria_id, codigo, nombre, descripcion, garantia_info, cost, Number(precio || 0), precio_m || null, Number(stock_minimo || 0), 1, codigo_barras || codigo]
+      [s.empresa_id, s.sede_id, categoria_id, codigo, nombre, descripcion, garantia_info, cost, precioValor, precioMValor, stockMinimoValor, 1, codigo_barras || codigo]
     );
-    const initial = Number(req.body?.stock_inicial ?? req.body?.stock_actual ?? req.body?.costo_inicial ?? 0);
+    const initial = Number(req.body?.stock_inicial ?? req.body?.stock_actual ?? 0);
+    if (!Number.isFinite(initial) || initial < 0) {
+      throw Object.assign(new Error('El stock inicial debe ser un valor válido no negativo'), { httpStatus: 400, code: 'STOCK_INICIAL_INVALIDO' });
+    }
     if (initial > 0) {
       await conn.query(`INSERT INTO inv_movimiento(empresa_id,sede_id,producto_id,usuario_id,tipo,cantidad,costo_unitario,comentario,fecha,activo) VALUES(?,?,?,?,?,?,?,?,UTC_TIMESTAMP(),1)`, [s.empresa_id, s.sede_id, r.insertId, req.user.id, 'IN_AJUSTE', initial, cost, 'Stock inicial']);
     }
@@ -71,46 +113,172 @@ async function crear(req, res) {
 async function actualizar(req, res) {
   const id = Number(req.params.id);
 
-  // El frontend trabaja con el nombre costo_promedio por claridad visual,
-  // pero en la base el campo real del producto es costo.
-  // Así evitamos que al editar se ignore el costo y vuelva a aparecer el valor anterior.
   if (req.body?.costo_promedio !== undefined && req.body?.costo === undefined) {
     req.body.costo = req.body.costo_promedio;
+  }
+
+  const producto = await productoEnScope(req, id);
+  if (!producto) return notFound(res, 'Producto no encontrado en la sede activa');
+
+  if (req.body?.categoria_id !== undefined) {
+    const categoriaId = Number(req.body.categoria_id);
+    const [[categoria]] = await pool.query(
+      `SELECT id FROM categoria WHERE id=? AND sede_id=? AND activo=1 LIMIT 1`,
+      [categoriaId, producto.sede_id]
+    );
+    if (!categoria) return badRequest(res, 'La categoría no pertenece a la sede del producto o está inactiva');
+  }
+
+  for (const field of ['costo', 'precio', 'precio_m', 'stock_minimo']) {
+    if (req.body?.[field] === undefined || req.body?.[field] === null || req.body?.[field] === '') continue;
+    const value = Number(req.body[field]);
+    if (!Number.isFinite(value) || value < 0) return badRequest(res, `${field} debe ser un valor no negativo`);
   }
 
   const fields = ['categoria_id','codigo','nombre','descripcion','garantia_info','costo','precio','precio_m','stock_minimo','codigo_barras','activo'];
   const upd = fields.filter(f => req.body?.[f] !== undefined);
   if (!upd.length) return ok(res, { id });
-  const scope = addScopeWhere(req, 'producto');
-  await pool.query(`UPDATE producto SET ${upd.map(f=>`${f}=?`).join(', ')}, fecha=UTC_TIMESTAMP() WHERE id=? ${scope.where.length ? 'AND ' + scope.where.join(' AND ') : ''}`, [...upd.map(f=> f==='activo' ? (req.body[f]?1:0) : req.body[f]), id, ...scope.params]);
+
+  await pool.query(
+    `UPDATE producto SET ${upd.map(f=>`${f}=?`).join(', ')}, fecha=UTC_TIMESTAMP() WHERE id=? AND sede_id=?`,
+    [...upd.map(f=> f==='activo' ? (req.body[f]?1:0) : req.body[f]), id, producto.sede_id]
+  );
   ok(res, { id, message: 'Producto actualizado' });
 }
+
 async function estado(req, res) { req.body.activo = req.body?.activo ? 1 : 0; return actualizar(req, res); }
 async function imgAgregar(req, res) {
   const productoId = Number(req.params.id);
+  const producto = await productoEnScope(req, productoId);
+  if (!producto) return notFound(res, 'Producto no encontrado en la sede activa');
+
   const { url, alt = null, es_principal = 0, orden = 0 } = req.body || {};
   if (!url) return badRequest(res, 'url requerida');
-  if (es_principal) await pool.query(`UPDATE producto_imagen SET es_principal=0 WHERE producto_id=?`, [productoId]);
-  const [r] = await pool.query(`INSERT INTO producto_imagen(producto_id,url,alt,es_principal,orden,fecha) VALUES(?,?,?,?,?,UTC_TIMESTAMP())`, [productoId, url, alt, es_principal ? 1 : 0, orden]);
-  created(res, { id: r.insertId, url });
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    if (es_principal) await conn.query(`UPDATE producto_imagen SET es_principal=0 WHERE producto_id=?`, [productoId]);
+    const [r] = await conn.query(
+      `INSERT INTO producto_imagen(producto_id,url,alt,es_principal,orden,fecha) VALUES(?,?,?,?,?,UTC_TIMESTAMP())`,
+      [productoId, url, alt, es_principal ? 1 : 0, Number(orden || 0)]
+    );
+    await conn.commit();
+    created(res, { id: r.insertId, url });
+  } catch (e) {
+    await conn.rollback();
+    throw e;
+  } finally {
+    conn.release();
+  }
 }
-async function imgListar(req, res) { const [items] = await pool.query(`SELECT * FROM producto_imagen WHERE producto_id=? ORDER BY es_principal DESC, orden ASC, id ASC`, [Number(req.params.id)]); ok(res, { items, total: items.length }); }
-async function imgSetPrincipal(req, res) { const { id, imgId } = req.params; await pool.query(`UPDATE producto_imagen SET es_principal=0 WHERE producto_id=?`,[id]); await pool.query(`UPDATE producto_imagen SET es_principal=1 WHERE id=? AND producto_id=?`,[imgId,id]); ok(res,{id:Number(imgId)}); }
-async function imgReordenar(req, res) { await pool.query(`UPDATE producto_imagen SET orden=? WHERE id=?`,[Number(req.body?.nuevo_orden ?? req.body?.orden ?? 0),Number(req.params.imgId)]); ok(res,{id:Number(req.params.imgId)}); }
-async function imgEliminar(req, res) { await pool.query(`DELETE FROM producto_imagen WHERE id=?`,[Number(req.params.imgId)]); ok(res,{id:Number(req.params.imgId)}); }
+
+async function imgListar(req, res) {
+  const productoId = Number(req.params.id);
+  const producto = await productoEnScope(req, productoId);
+  if (!producto) return notFound(res, 'Producto no encontrado en la sede activa');
+  const [items] = await pool.query(`SELECT * FROM producto_imagen WHERE producto_id=? ORDER BY es_principal DESC, orden ASC, id ASC`, [productoId]);
+  ok(res, { items, total: items.length });
+}
+
+async function imgSetPrincipal(req, res) {
+  const productoId = Number(req.params.id);
+  const imgId = Number(req.params.imgId);
+  const producto = await productoEnScope(req, productoId);
+  if (!producto) return notFound(res, 'Producto no encontrado en la sede activa');
+  const [[img]] = await pool.query(`SELECT id FROM producto_imagen WHERE id=? AND producto_id=? LIMIT 1`, [imgId, productoId]);
+  if (!img) return notFound(res, 'Imagen no encontrada para este producto');
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    await conn.query(`UPDATE producto_imagen SET es_principal=0 WHERE producto_id=?`, [productoId]);
+    await conn.query(`UPDATE producto_imagen SET es_principal=1 WHERE id=? AND producto_id=?`, [imgId, productoId]);
+    await conn.commit();
+    ok(res, { id: imgId });
+  } catch (e) {
+    await conn.rollback();
+    throw e;
+  } finally {
+    conn.release();
+  }
+}
+
+async function imgReordenar(req, res) {
+  const imgId = Number(req.params.imgId);
+  const img = await imagenEnScope(req, imgId);
+  if (!img) return notFound(res, 'Imagen no encontrada en la sede activa');
+  await pool.query(`UPDATE producto_imagen SET orden=? WHERE id=?`, [Number(req.body?.nuevo_orden ?? req.body?.orden ?? 0), imgId]);
+  ok(res, { id: imgId });
+}
+
+async function imgEliminar(req, res) {
+  const imgId = Number(req.params.imgId);
+  const img = await imagenEnScope(req, imgId);
+  if (!img) return notFound(res, 'Imagen no encontrada en la sede activa');
+  await pool.query(`DELETE FROM producto_imagen WHERE id=?`, [imgId]);
+  ok(res, { id: imgId });
+}
+
+function limpiarArchivosSubidos(files = []) {
+  for (const f of files) {
+    if (!f?.path) continue;
+    try { fs.unlinkSync(f.path); } catch { /* archivo ya movido/eliminado */ }
+  }
+}
+
 async function imgUpload(req, res) {
   const id = Number(req.params.id);
   const files = req.files || [];
   if (!files.length) return badRequest(res, 'No se subieron archivos');
-  const uploaded = [];
-  for (let i=0; i<files.length; i++) {
-    const f = files[i];
-    const publicPath = `/productos/${id}/imagenes/public/${path.basename(f.filename)}`;
-    await pool.query(`INSERT INTO producto_imagen(producto_id,url,alt,es_principal,orden,fecha) VALUES(?,?,?,?,?,UTC_TIMESTAMP())`, [id, publicPath, f.originalname, i===0?1:0, i]);
-    uploaded.push({ url: publicPath });
+
+  const producto = await productoEnScope(req, id);
+  if (!producto) {
+    limpiarArchivosSubidos(files);
+    return notFound(res, 'Producto no encontrado en la sede activa');
   }
-  created(res, { uploaded });
+
+  const [[actuales]] = await pool.query(
+    `SELECT COUNT(*) AS total, COALESCE(MAX(orden),-1) AS max_orden FROM producto_imagen WHERE producto_id=?`,
+    [id]
+  );
+  const totalActual = Number(actuales?.total || 0);
+  if (totalActual + files.length > 3) {
+    limpiarArchivosSubidos(files);
+    return badRequest(res, `Máximo 3 imágenes por producto. Actualmente hay ${totalActual}.`);
+  }
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+
+    // El comportamiento previo marcaba la primera imagen de cada carga como principal,
+    // pero no quitaba la principal anterior. Dejamos una sola principal de forma atómica.
+    await conn.query(`UPDATE producto_imagen SET es_principal=0 WHERE producto_id=?`, [id]);
+
+    const uploaded = [];
+    const inicioOrden = Number(actuales?.max_orden ?? -1) + 1;
+    for (let i = 0; i < files.length; i++) {
+      const f = files[i];
+      const publicPath = `/productos/${id}/imagenes/public/${path.basename(f.filename)}`;
+      const [r] = await conn.query(
+        `INSERT INTO producto_imagen(producto_id,url,alt,es_principal,orden,fecha) VALUES(?,?,?,?,?,UTC_TIMESTAMP())`,
+        [id, publicPath, f.originalname, i === 0 ? 1 : 0, inicioOrden + i]
+      );
+      uploaded.push({ id: r.insertId, url: publicPath, es_principal: i === 0 ? 1 : 0 });
+    }
+
+    await conn.commit();
+    created(res, { uploaded });
+  } catch (e) {
+    await conn.rollback();
+    limpiarArchivosSubidos(files);
+    throw e;
+  } finally {
+    conn.release();
+  }
 }
+
 async function webCatalogo(req, res) { return publicCatalogo(req, res); }
 async function webProducto(req, res) { return publicProducto(req, res); }
 async function publicCatalogo(req, res) {

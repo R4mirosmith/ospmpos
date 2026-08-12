@@ -9,8 +9,47 @@ function entidadTransferencia(value) {
   return ['NEQUI', 'BANCOLOMBIA', 'DAVIPLATA', 'OTRO'].includes(v) ? v : null;
 }
 
+async function resolverClienteVenta(conn, scope, clienteIdSolicitado) {
+  const requested = Number(clienteIdSolicitado || 0);
+  if (requested > 0) {
+    const [[cliente]] = await conn.query(
+      `SELECT id FROM cliente WHERE id=? AND empresa_id=? AND sede_id=? AND activo=1 LIMIT 1`,
+      [requested, scope.empresa_id, scope.sede_id]
+    );
+    if (cliente) return Number(cliente.id);
+
+    // Compatibilidad con versiones anteriores del frontend que enviaban siempre id=1
+    // para "Consumidor final". En sedes distintas a la inicial, resolvemos el cliente
+    // equivalente de esa sede en vez de asociar la venta a un cliente ajeno.
+    if (requested !== 1) {
+      throw Object.assign(new Error('El cliente no pertenece a la sede activa o está inactivo'), {
+        httpStatus: 400,
+        code: 'CLIENTE_INVALIDO',
+      });
+    }
+  }
+
+  const [[existente]] = await conn.query(
+    `SELECT id
+       FROM cliente
+      WHERE empresa_id=? AND sede_id=? AND activo=1
+        AND (documento='00000000' OR LOWER(nombre)='consumidor final')
+      ORDER BY CASE WHEN documento='00000000' THEN 0 ELSE 1 END, id
+      LIMIT 1`,
+    [scope.empresa_id, scope.sede_id]
+  );
+  if (existente) return Number(existente.id);
+
+  const [r] = await conn.query(
+    `INSERT INTO cliente(empresa_id,sede_id,nombre,documento,activo,fecha)
+     VALUES(?,?, 'Consumidor final','00000000',1,UTC_TIMESTAMP())`,
+    [scope.empresa_id, scope.sede_id]
+  );
+  return Number(r.insertId);
+}
+
 async function crear(req, res) {
-  const { cliente_id = 1, canal = 'POS', direccion = null, descuento = 0, descuento_valor = null, impuesto = 0, detalles = [] } = req.body || {};
+  const { cliente_id = null, canal = 'POS', direccion = null, descuento = 0, descuento_valor = null, impuesto = 0, detalles = [] } = req.body || {};
   if (!Array.isArray(detalles) || !detalles.length) return badRequest(res, 'detalles requerido');
 
   const s = await writeScope(req);
@@ -20,10 +59,11 @@ async function crear(req, res) {
 
   try {
     await conn.beginTransaction();
+    const clienteId = await resolverClienteVenta(conn, s, cliente_id);
     const [r] = await conn.query(
       `INSERT INTO venta(empresa_id,sede_id,cliente_id,usuario_id,subtotal,descuento,impuesto,total,canal,fecha,direccion_envio,estado,activo,pagado,saldo)
        VALUES(?,?,?,?,0,0,0,0,?,UTC_TIMESTAMP(),?,'EMITIDA',1,0,0)`,
-      [s.empresa_id, s.sede_id, cliente_id, userId, String(canal).toUpperCase(), direccion]
+      [s.empresa_id, s.sede_id, clienteId, userId, String(canal).toUpperCase(), direccion]
     );
 
     const ventaId = r.insertId;
@@ -99,6 +139,14 @@ async function pagar(req, res) {
     await conn.beginTransaction();
     const [[v]] = await conn.query(`SELECT v.* FROM venta v WHERE v.id=? AND v.activo=1 ${scope.where.length ? 'AND ' + scope.where.join(' AND ') : ''} FOR UPDATE`, [ventaId, ...scope.params]);
     if (!v) throw Object.assign(new Error('Venta no existe o no pertenece a tu sede'), { httpStatus: 404, code: 'NOT_FOUND' });
+    const saldoActual = Math.max(0, num(v.total) - num(v.pagado));
+    if (saldoActual <= 0.005) {
+      throw Object.assign(new Error('La venta ya está completamente pagada'), { httpStatus: 400, code: 'VENTA_YA_PAGADA' });
+    }
+    if (pay - saldoActual > 0.005) {
+      throw Object.assign(new Error(`El pago excede el saldo pendiente (${saldoActual.toFixed(2)})`), { httpStatus: 400, code: 'PAGO_EXCEDE_SALDO' });
+    }
+
     const referenciaFinal = metodoPago === 'TRANSFERENCIA' ? null : (clean(referencia) || null);
     await conn.query(`INSERT INTO venta_pago(venta_id,metodo,entidad_transferencia,monto,referencia,recibido,cambio,fecha) VALUES(?,?,?,?,?,?,?,UTC_TIMESTAMP())`, [ventaId, metodoPago, entidad, pay, referenciaFinal, recibido === null ? pay : num(recibido), cambio === null ? 0 : num(cambio)]);
     const nuevoPagado = num(v.pagado) + pay;
@@ -249,7 +297,11 @@ async function anular(req, res) {
     await conn.beginTransaction();
     const [r] = await conn.query(`UPDATE venta v SET v.estado='ANULADA', v.activo=0, v.fecha_anulacion=UTC_TIMESTAMP(), v.anulado_por=?, v.motivo_anulacion=? WHERE v.id=? ${scope.where.length ? 'AND ' + scope.where.join(' AND ') : ''}`, [req.user.id, motivo, id, ...scope.params]);
     if (!r.affectedRows) throw Object.assign(new Error('Venta no encontrada en tu sede'), { httpStatus: 404, code: 'NOT_FOUND' });
-    await conn.query(`UPDATE inv_movimiento SET activo=0 WHERE venta_id=? AND tipo='OUT_VENTA'`, [id]);
+    // Al anular una venta se revierten TODOS sus movimientos de inventario.
+    // Esto incluye devoluciones previas (IN_DEV_VENTA); si solo se anulaba OUT_VENTA,
+    // una devolución anterior quedaba sumando stock de forma incorrecta.
+    await conn.query(`UPDATE inv_movimiento SET activo=0 WHERE venta_id=?`, [id]);
+    await conn.query(`UPDATE devolucion_venta SET activo=0 WHERE venta_id=?`, [id]);
     await conn.query(`UPDATE venta_pago SET anulado=1, fecha_anulacion=UTC_TIMESTAMP() WHERE venta_id=?`, [id]);
     await conn.commit();
     ok(res, { id, message: 'Venta anulada' });

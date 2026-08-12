@@ -1,5 +1,5 @@
 const { pool, pageLimit } = require('../utils/sql');
-const { ok, created, badRequest } = require('../utils/http');
+const { ok, created, badRequest, notFound } = require('../utils/http');
 const { writeScope, addScopeWhere, clean, toInt } = require('../utils/scope');
 
 async function listar(req, res) {
@@ -53,25 +53,53 @@ async function get(req, res) {
 async function crear(req, res) {
   const { categoria_id = null, codigo, nombre, descripcion = '', precio = 0, activo = 1 } = req.body || {};
   if (!codigo || !nombre) return badRequest(res, 'codigo y nombre requeridos');
+  const valorPrecio = Number(precio || 0);
+  if (!Number.isFinite(valorPrecio) || valorPrecio < 0) return badRequest(res, 'El precio debe ser un valor no negativo');
+
   const s = await writeScope(req);
+  if (categoria_id) {
+    const [[categoria]] = await pool.query(
+      `SELECT id FROM categoria WHERE id=? AND sede_id=? AND activo=1 LIMIT 1`,
+      [Number(categoria_id), s.sede_id]
+    );
+    if (!categoria) return badRequest(res, 'La categoría no pertenece a la sede activa o está inactiva');
+  }
+
   const [r] = await pool.query(
     `INSERT INTO servicio(empresa_id,sede_id,categoria_id,codigo,nombre,descripcion,precio,activo,fecha)
      VALUES(?,?,?,?,?,?,?,?,UTC_TIMESTAMP())`,
-    [s.empresa_id, s.sede_id, categoria_id || null, codigo, nombre, descripcion, Number(precio || 0), activo ? 1 : 0]
+    [s.empresa_id, s.sede_id, categoria_id || null, codigo, nombre, descripcion, valorPrecio, activo ? 1 : 0]
   );
   created(res, { id: r.insertId, message: 'Servicio creado' });
 }
 
 async function actualizar(req, res) {
   const id = Number(req.params.id);
+  const scope = addScopeWhere(req, 'sv');
+  const [[servicio]] = await pool.query(
+    `SELECT sv.id, sv.sede_id FROM servicio sv WHERE sv.id=? ${scope.where.length ? 'AND ' + scope.where.join(' AND ') : ''} LIMIT 1`,
+    [id, ...scope.params]
+  );
+  if (!servicio) return notFound(res, 'Servicio no encontrado en la sede activa');
+
+  if (req.body?.precio !== undefined && req.body?.precio !== null && req.body?.precio !== '') {
+    const valorPrecio = Number(req.body.precio);
+    if (!Number.isFinite(valorPrecio) || valorPrecio < 0) return badRequest(res, 'El precio debe ser un valor no negativo');
+  }
+  if (req.body?.categoria_id !== undefined && req.body?.categoria_id !== null && req.body?.categoria_id !== '') {
+    const [[categoria]] = await pool.query(
+      `SELECT id FROM categoria WHERE id=? AND sede_id=? AND activo=1 LIMIT 1`,
+      [Number(req.body.categoria_id), servicio.sede_id]
+    );
+    if (!categoria) return badRequest(res, 'La categoría no pertenece a la sede del servicio o está inactiva');
+  }
+
   const fields = ['categoria_id', 'codigo', 'nombre', 'descripcion', 'precio', 'activo'];
   const upd = fields.filter(f => req.body?.[f] !== undefined);
   if (!upd.length) return ok(res, { id });
-  const scope = addScopeWhere(req, 'servicio');
   await pool.query(
-    `UPDATE servicio SET ${upd.map(f => `${f}=?`).join(', ')}, fecha=UTC_TIMESTAMP()
-      WHERE id=? ${scope.where.length ? 'AND ' + scope.where.join(' AND ') : ''}`,
-    [...upd.map(f => f === 'activo' ? (req.body[f] ? 1 : 0) : (req.body[f] === '' ? null : req.body[f])), id, ...scope.params]
+    `UPDATE servicio SET ${upd.map(f => `${f}=?`).join(', ')}, fecha=UTC_TIMESTAMP() WHERE id=? AND sede_id=?`,
+    [...upd.map(f => f === 'activo' ? (req.body[f] ? 1 : 0) : (req.body[f] === '' ? null : req.body[f])), id, servicio.sede_id]
   );
   ok(res, { id, message: 'Servicio actualizado' });
 }

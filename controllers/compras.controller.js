@@ -125,6 +125,14 @@ async function crear(req, res) {
     await conn.beginTransaction();
 
     let subtotal = 0;
+    const [[proveedor]] = await conn.query(
+      `SELECT id FROM proveedor WHERE id = ? AND sede_id = ? AND activo = 1 LIMIT 1`,
+      [proveedor_id, s.sede_id]
+    );
+    if (!proveedor) {
+      throw Object.assign(new Error('El proveedor no pertenece a la sede activa o está inactivo'), { httpStatus: 400, code: 'PROVEEDOR_INVALIDO' });
+    }
+
     const [r] = await conn.query(
       `INSERT INTO compra(empresa_id,sede_id,proveedor_id,usuario_id,subtotal,total,fecha,activo)
        VALUES(?,?,?,?,0,0,UTC_TIMESTAMP(),1)`,
@@ -137,6 +145,7 @@ async function crear(req, res) {
       const cantidad = num(d.cantidad);
       const costo = num(d.costo_unitario);
       if (!d.producto_id || cantidad <= 0) throw Object.assign(new Error('Producto y cantidad válidos son requeridos'), { httpStatus: 400 });
+      if (costo < 0) throw Object.assign(new Error('El costo unitario no puede ser negativo'), { httpStatus: 400, code: 'COSTO_INVALIDO' });
 
       const [[producto]] = await conn.query(
         `SELECT id FROM producto WHERE id = ? AND sede_id = ? AND activo = 1 LIMIT 1`,
@@ -174,14 +183,30 @@ async function crear(req, res) {
 async function anular(req, res) {
   const id = Number(req.params.id);
   const scope = addScopeWhere(req, 'c');
-  const [r] = await pool.query(
-    `UPDATE compra c SET c.activo=0 WHERE c.id=? ${scope.where.length ? 'AND ' + scope.where.join(' AND ') : ''}`,
-    [id, ...scope.params]
-  );
-  if (r.affectedRows) {
-    await pool.query(`UPDATE inv_movimiento SET activo=0 WHERE compra_id=?`, [id]);
+  const conn = await pool.getConnection();
+
+  try {
+    await conn.beginTransaction();
+    const [r] = await conn.query(
+      `UPDATE compra c
+          SET c.activo = 0
+        WHERE c.id = ? AND c.activo = 1
+        ${scope.where.length ? 'AND ' + scope.where.join(' AND ') : ''}`,
+      [id, ...scope.params]
+    );
+
+    if (r.affectedRows) {
+      await conn.query(`UPDATE inv_movimiento SET activo=0 WHERE compra_id=?`, [id]);
+    }
+
+    await conn.commit();
+    ok(res, { id, message: r.affectedRows ? 'Compra anulada' : 'Compra no encontrada, ya anulada o fuera de tu sede' });
+  } catch (e) {
+    await conn.rollback();
+    throw e;
+  } finally {
+    conn.release();
   }
-  ok(res, { id, message: r.affectedRows ? 'Compra anulada' : 'Compra no encontrada en tu sede' });
 }
 
 module.exports = { listar, obtener, crear, anular };

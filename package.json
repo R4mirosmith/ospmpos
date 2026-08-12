@@ -6,7 +6,8 @@
   "type": "commonjs",
   "scripts": {
     "dev": "nodemon server/server.js",
-    "start": "node server/server.js"
+    "start": "node server/server.js",
+    "test:prod-safety": "node tests/prod-safety-regression.test.js"
   },
   "dependencies": {
     "cors": "^2.8.5",
