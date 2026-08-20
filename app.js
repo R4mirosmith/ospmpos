@@ -6,7 +6,20 @@ const config = require('./config');
 const { errorHandler } = require('./utils/http');
 
 const app = express();
-app.use(cors({ origin: config.server.corsOrigin === '*' ? true : config.server.corsOrigin, credentials: true }));
+const configuredCorsOrigins = String(config.server.corsOrigin || '*')
+  .split(',')
+  .map((value) => value.trim())
+  .filter(Boolean);
+
+const corsOrigin = configuredCorsOrigins.includes('*')
+  ? true
+  : (origin, callback) => {
+      // Permite requests sin Origin (health checks, apps nativas, server-to-server)
+      if (!origin || configuredCorsOrigins.includes(origin)) return callback(null, true);
+      return callback(new Error('Origen no permitido por CORS'));
+    };
+
+app.use(cors({ origin: corsOrigin, credentials: true }));
 app.use(express.json({ limit: '8mb' }));
 app.use(express.urlencoded({ extended: true }));
 app.use(morgan('dev'));
