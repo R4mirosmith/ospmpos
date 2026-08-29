@@ -1,7 +1,7 @@
 const { pool } = require('../db/pool');
 const { ok, badRequest, unauthorized } = require('../utils/http');
 const { signAccess, signRefresh, verifyRefresh } = require('../utils/jwt');
-const { verifyPassword } = require('../utils/password');
+const { verifyPassword, makeHash, needsRehash } = require('../utils/password');
 
 async function userSedes(userId, role = '') {
   const isAdmin = String(role || '').toUpperCase() === 'ADMIN';
@@ -102,6 +102,11 @@ async function loginCtrl(req, res) {
   }
   if (Number(user.activo) !== 1) return unauthorized(res, 'Usuario inactivo');
 
+  // Migra de forma transparente hashes antiguos al esquema scrypt al iniciar sesión.
+  if (needsRehash(user.hash_password)) {
+    await pool.query(`UPDATE usuario SET hash_password=?, fecha=UTC_TIMESTAMP() WHERE id=?`, [makeHash(password), user.id]);
+  }
+
   const role = String(user.role || 'USER').toUpperCase();
   const sedes = await userSedes(user.id, role);
   if (!sedes.length) return unauthorized(res, 'El usuario no tiene sedes asignadas');
@@ -157,8 +162,10 @@ async function refreshCtrl(req, res) {
     );
     const user = rows[0];
     if (!user) return unauthorized(res, 'Usuario no encontrado');
+    if (Number(user.activo) !== 1) return unauthorized(res, 'Usuario inactivo');
     const role = String(user.role || payload.role || 'USER').toUpperCase();
     const sedes = await userSedes(user.id, role);
+    if (!sedes.length) return unauthorized(res, 'El usuario no tiene sedes activas asignadas');
     const sede = sedes.find(s => Number(s.sede_id) === Number(sede_id || payload.sede_id)) || sedes[0];
     const accessPayload = buildPayload(user, role, sede);
     return ok(res, { token: signAccess(accessPayload), ...accessPayload, sedes });

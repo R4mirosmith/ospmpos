@@ -20,6 +20,7 @@ require.cache[dbPoolPath] = {
 const inventario = require('../controllers/inventario.controller');
 const ventas = require('../controllers/ventas.controller');
 const pedidosWeb = require('../controllers/pedidosWeb.controller');
+const compras = require('../controllers/compras.controller');
 
 function resMock() {
   return {
@@ -209,6 +210,79 @@ async function testPedidoSinStockHaceRollback() {
   assert.strictEqual(committed, false);
 }
 
+
+async function testAjusteNegativoNoPermiteStockMenorACero() {
+  activeSedePool();
+  let inserted = false;
+  let rolledBack = false;
+  const conn = {
+    beginTransaction: async () => {}, commit: async () => {}, rollback: async () => { rolledBack = true; }, release: () => {},
+    query: async (sql) => {
+      if (/FROM producto/i.test(sql)) return [[{ id: 10, nombre: 'Producto', costo: 5 }]];
+      if (/COALESCE\(SUM\(cantidad\),0\) AS stock/i.test(sql)) return [[{ stock: 1 }]];
+      if (/INSERT INTO inv_movimiento/i.test(sql)) { inserted = true; return [{ insertId: 103 }]; }
+      throw new Error(`SQL inesperado ajuste sin stock: ${sql}`);
+    },
+  };
+  fakePool.getConnection = async () => conn;
+  let error;
+  try { await inventario.ajuste(reqBase({ producto_id: 10, cantidad: -2 }), resMock()); } catch (e) { error = e; }
+  assert(error);
+  assert.strictEqual(error.code, 'STOCK_INSUFICIENTE');
+  assert.strictEqual(inserted, false);
+  assert.strictEqual(rolledBack, true);
+}
+
+async function testAnularCompraNoDejaStockNegativo() {
+  let rolledBack = false;
+  let compraUpdated = false;
+  fakePool.getConnection = async () => ({
+    beginTransaction: async () => {}, commit: async () => {}, rollback: async () => { rolledBack = true; }, release: () => {},
+    query: async (sql) => {
+      if (/FROM compra c/i.test(sql) && /FOR UPDATE/i.test(sql)) return [[{ id: 9, sede_id: 2 }]];
+      if (/FROM inv_movimiento/i.test(sql) && /GROUP BY producto_id/i.test(sql)) return [[{ producto_id: 10, cantidad: 5 }]];
+      if (/SELECT id FROM producto/i.test(sql)) return [[{ id: 10 }]];
+      if (/COALESCE\(SUM\(cantidad\),0\) AS stock/i.test(sql)) return [[{ stock: 3 }]];
+      if (/UPDATE compra SET activo=0/i.test(sql)) { compraUpdated = true; return [{ affectedRows: 1 }]; }
+      throw new Error(`SQL inesperado anular compra: ${sql}`);
+    },
+  });
+  const req = reqBase({});
+  req.params.id = '9';
+  let error;
+  try { await compras.anular(req, resMock()); } catch (e) { error = e; }
+  assert(error);
+  assert.strictEqual(error.code, 'COMPRA_ANULACION_STOCK_INSUFICIENTE');
+  assert.strictEqual(compraUpdated, false);
+  assert.strictEqual(rolledBack, true);
+}
+
+async function testVentaRechazaPrecioManipulado() {
+  activeSedePool();
+  let inventoryInserted = false;
+  let rolledBack = false;
+  const conn = {
+    beginTransaction: async () => {}, commit: async () => {}, rollback: async () => { rolledBack = true; }, release: () => {},
+    query: async (sql) => {
+      if (/FROM cliente/i.test(sql)) return [[{ id: 1 }]];
+      if (/INSERT INTO venta\(/i.test(sql)) return [{ insertId: 90 }];
+      if (/SELECT id,nombre,codigo,precio,precio_m FROM producto/i.test(sql)) {
+        return [[{ id: 10, nombre: 'Producto', codigo: 'P10', precio: 20000, precio_m: 18000 }]];
+      }
+      if (/INSERT INTO inv_movimiento/i.test(sql)) { inventoryInserted = true; return [{ insertId: 1 }]; }
+      throw new Error(`SQL inesperado precio manipulado: ${sql}`);
+    },
+  };
+  fakePool.getConnection = async () => conn;
+  const req = reqBase({ detalles: [{ producto_id: 10, cantidad: 1, precio_unitario: 100 }] });
+  let error;
+  try { await ventas.crear(req, resMock()); } catch (e) { error = e; }
+  assert(error);
+  assert.strictEqual(error.code, 'PRECIO_DESACTUALIZADO');
+  assert.strictEqual(inventoryInserted, false);
+  assert.strictEqual(rolledBack, true);
+}
+
 const tests = [
   testAjusteNegativoResta,
   testAjustePositivoSuma,
@@ -217,6 +291,9 @@ const tests = [
   testAnularVentaRevierteVentaYDevolucion,
   testPedidoFacturadoEsIdempotente,
   testPedidoSinStockHaceRollback,
+  testAjusteNegativoNoPermiteStockMenorACero,
+  testAnularCompraNoDejaStockNegativo,
+  testVentaRechazaPrecioManipulado,
 ];
 
 (async () => {

@@ -4,6 +4,22 @@ const { writeScope, addScopeWhere, colombiaDateRange, clean } = require('../util
 
 function num(v, def = 0) { const n = Number(v); return Number.isFinite(n) ? n : def; }
 function itemTipo(d) { return String(d.item_tipo || (d.servicio_id ? 'SERVICIO' : 'PRODUCTO')).toUpperCase(); }
+function sameMoney(a, b) { return Math.round(num(a, NaN) * 100) === Math.round(num(b, NaN) * 100); }
+function precioPermitido(solicitado, permitidos, nombre) {
+  const requested = num(solicitado, NaN);
+  if (!Number.isFinite(requested) || requested < 0) {
+    throw Object.assign(new Error(`Precio inválido para ${nombre}`), { httpStatus: 400, code: 'PRECIO_INVALIDO' });
+  }
+  const allowed = permitidos.map((value) => num(value, NaN)).filter((value) => Number.isFinite(value) && value >= 0);
+  const match = allowed.find((value) => sameMoney(value, requested));
+  if (match === undefined) {
+    throw Object.assign(new Error(`El precio enviado para ${nombre} no coincide con el precio vigente del producto/servicio`), {
+      httpStatus: 409,
+      code: 'PRECIO_DESACTUALIZADO',
+    });
+  }
+  return match;
+}
 function entidadTransferencia(value) {
   const v = clean(value || '').toUpperCase();
   return ['NEQUI', 'BANCOLOMBIA', 'DAVIPLATA', 'OTRO'].includes(v) ? v : null;
@@ -51,7 +67,9 @@ async function resolverClienteVenta(conn, scope, clienteIdSolicitado) {
 async function crear(req, res) {
   const { cliente_id = null, canal = 'POS', direccion = null, descuento = 0, descuento_valor = null, impuesto = 0, detalles = [] } = req.body || {};
   if (!Array.isArray(detalles) || !detalles.length) return badRequest(res, 'detalles requerido');
+  if (detalles.length > 200) return badRequest(res, 'La venta supera el máximo de 200 líneas');
 
+  const impuestoAplicado = Math.max(0, num(impuesto, 0));
   const s = await writeScope(req);
   const userId = req.user.id;
   const descSolicitado = Math.max(0, num(descuento_valor ?? descuento, 0));
@@ -80,7 +98,7 @@ async function crear(req, res) {
         if (!servicioId) throw Object.assign(new Error('Servicio inválido'), { httpStatus: 400, code: 'SERVICIO_INVALIDO' });
         const [[servicio]] = await conn.query(`SELECT id,nombre,codigo,precio FROM servicio WHERE id=? AND sede_id=? AND activo=1`, [servicioId, s.sede_id]);
         if (!servicio) throw Object.assign(new Error(`Servicio ${servicioId} no existe en esta sede`), { httpStatus: 400, code: 'SERVICIO_INVALIDO' });
-        const precio = num(d.precio_unitario, num(servicio.precio));
+        const precio = precioPermitido(d.precio_unitario, [servicio.precio], servicio.nombre);
         const subtotalLinea = +(cantidad * precio).toFixed(2);
         const descuentoLinea = Math.min(subtotalLinea, lineDesc);
         const totalLinea = Math.max(0, +(subtotalLinea - descuentoLinea).toFixed(2));
@@ -94,10 +112,12 @@ async function crear(req, res) {
       }
 
       const productoId = Number(d.producto_id || d.id);
-      const precio = num(d.precio_unitario);
       if (!productoId) throw Object.assign(new Error('Producto inválido'), { httpStatus: 400, code: 'PRODUCTO_INVALIDO' });
-      const [[productoLock]] = await conn.query(`SELECT id,nombre,codigo FROM producto WHERE id=? AND sede_id=? AND activo=1 FOR UPDATE`, [productoId, s.sede_id]);
+      const [[productoLock]] = await conn.query(`SELECT id,nombre,codigo,precio,precio_m FROM producto WHERE id=? AND sede_id=? AND activo=1 FOR UPDATE`, [productoId, s.sede_id]);
       if (!productoLock) throw Object.assign(new Error(`Producto ${productoId} no existe en esta sede`), { httpStatus: 400, code: 'PRODUCTO_INVALIDO' });
+      const precios = [productoLock.precio];
+      if (num(productoLock.precio_m, 0) > 0) precios.push(productoLock.precio_m);
+      const precio = precioPermitido(d.precio_unitario, precios, productoLock.nombre);
       const [[stockRow]] = await conn.query(`SELECT COALESCE(SUM(cantidad),0) stock FROM inv_movimiento WHERE producto_id=? AND sede_id=? AND activo=1`, [productoId, s.sede_id]);
       if (Number(stockRow.stock || 0) < cantidad) throw Object.assign(new Error(`Stock insuficiente para ${productoLock.nombre}`), { httpStatus: 400, code: 'STOCK_INSUFICIENTE' });
       const subtotalLinea = +(cantidad * precio).toFixed(2);
@@ -117,10 +137,10 @@ async function crear(req, res) {
     }
 
     const desc = Math.min(subtotal, descSolicitado);
-    const total = Math.max(0, +(subtotal - desc + num(impuesto)).toFixed(2));
-    await conn.query(`UPDATE venta SET subtotal=?, descuento=?, impuesto=?, total=?, saldo=? WHERE id=?`, [subtotal, desc, num(impuesto), total, total, ventaId]);
+    const total = Math.max(0, +(subtotal - desc + impuestoAplicado).toFixed(2));
+    await conn.query(`UPDATE venta SET subtotal=?, descuento=?, impuesto=?, total=?, saldo=? WHERE id=?`, [subtotal, desc, impuestoAplicado, total, total, ventaId]);
     await conn.commit();
-    created(res, { venta_id: ventaId, subtotal, descuento: desc, descuento_solicitado: descSolicitado, impuesto: num(impuesto), total, saldo: total });
+    created(res, { venta_id: ventaId, subtotal, descuento: desc, descuento_solicitado: descSolicitado, impuesto: impuestoAplicado, total, saldo: total });
   } catch (e) { await conn.rollback(); throw e; } finally { conn.release(); }
 }
 
@@ -129,6 +149,8 @@ async function pagar(req, res) {
   const { metodo, monto, referencia = null, recibido = null, cambio = null, entidad_transferencia = null } = req.body || {};
   if (!ventaId || !metodo) return badRequest(res, 'venta y método requeridos');
   const metodoPago = String(metodo).toUpperCase();
+  const metodosPermitidos = new Set(['EFECTIVO', 'TARJETA', 'TRANSFERENCIA', 'NEQUI', 'DAVIPLATA', 'BONO', 'OTRO']);
+  if (!metodosPermitidos.has(metodoPago)) return badRequest(res, 'Método de pago no permitido');
   const entidad = metodoPago === 'TRANSFERENCIA' ? entidadTransferencia(entidad_transferencia) : null;
   if (metodoPago === 'TRANSFERENCIA' && !entidad) return badRequest(res, 'Selecciona si la transferencia fue por Nequi, Bancolombia, Daviplata u Otro');
   const pay = num(monto);

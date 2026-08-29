@@ -1,7 +1,9 @@
+const fs = require('fs');
 const path = require('path');
 const { pool } = require('../db/pool');
 const { ok, created, badRequest, notFound } = require('../utils/http');
 const { clean, toInt } = require('../utils/scope');
+const config = require('../config');
 
 function hasOwn(obj, key) {
   return Object.prototype.hasOwnProperty.call(obj || {}, key);
@@ -159,11 +161,23 @@ async function subirLogoSede(req, res) {
   if (!id) return badRequest(res, 'Sede inválida');
   if (!req.file) return badRequest(res, 'Selecciona una imagen para el logo');
 
-  const [[sede]] = await pool.query(`SELECT id FROM sede WHERE id=? LIMIT 1`, [id]);
-  if (!sede) return notFound(res, 'Sede no encontrada');
+  const [[sede]] = await pool.query(`SELECT id, logo_url FROM sede WHERE id=? LIMIT 1`, [id]);
+  if (!sede) {
+    try { fs.unlinkSync(req.file.path); } catch {}
+    return notFound(res, 'Sede no encontrada');
+  }
 
   const logoUrl = `/files/sedes/${id}/logo/${path.basename(req.file.filename)}`;
   await pool.query(`UPDATE sede SET logo_url=? WHERE id=?`, [logoUrl, id]);
+
+  // Elimina el archivo anterior solo si pertenecía al almacenamiento local de esta sede.
+  const oldPrefix = `/files/sedes/${id}/logo/`;
+  if (String(sede.logo_url || '').startsWith(oldPrefix) && sede.logo_url !== logoUrl) {
+    const oldName = path.basename(String(sede.logo_url).slice(oldPrefix.length));
+    const oldPath = path.resolve(config.uploads.dir, 'sedes', String(id), 'logo', oldName);
+    try { fs.unlinkSync(oldPath); } catch {}
+  }
+
   ok(res, { id, logo_url: logoUrl, message: 'Logo actualizado' });
 }
 

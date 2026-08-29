@@ -7,7 +7,11 @@
   "scripts": {
     "dev": "nodemon server/server.js",
     "start": "node server/server.js",
-    "test:prod-safety": "node tests/prod-safety-regression.test.js"
+    "test:prod-safety": "node tests/prod-safety-regression.test.js",
+    "test:video": "node tests/video-duration.test.js",
+    "test": "npm run test:prod-safety && npm run test:video && npm run test:password && npm run test:auth",
+    "test:password": "node tests/password.test.js",
+    "test:auth": "node tests/auth-middleware.test.js"
   },
   "dependencies": {
     "cors": "^2.8.5",

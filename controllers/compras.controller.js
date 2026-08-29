@@ -182,25 +182,71 @@ async function crear(req, res) {
 
 async function anular(req, res) {
   const id = Number(req.params.id);
+  if (!Number.isInteger(id) || id <= 0) return badRequest(res, 'Compra inválida');
+
   const scope = addScopeWhere(req, 'c');
   const conn = await pool.getConnection();
 
   try {
     await conn.beginTransaction();
-    const [r] = await conn.query(
-      `UPDATE compra c
-          SET c.activo = 0
+
+    // Primero bloqueamos la compra. No desactivamos nada hasta comprobar que
+    // retirar sus entradas no dejará existencias negativas.
+    const [[compra]] = await conn.query(
+      `SELECT c.id, c.sede_id
+         FROM compra c
         WHERE c.id = ? AND c.activo = 1
-        ${scope.where.length ? 'AND ' + scope.where.join(' AND ') : ''}`,
+        ${scope.where.length ? 'AND ' + scope.where.join(' AND ') : ''}
+        LIMIT 1 FOR UPDATE`,
       [id, ...scope.params]
     );
 
-    if (r.affectedRows) {
-      await conn.query(`UPDATE inv_movimiento SET activo=0 WHERE compra_id=?`, [id]);
+    if (!compra) {
+      await conn.commit();
+      return ok(res, { id, message: 'Compra no encontrada, ya anulada o fuera de tu sede' });
     }
 
+    // Usamos los movimientos reales asociados a la compra, no solo el detalle,
+    // porque son esos movimientos los que se van a desactivar.
+    const [entradas] = await conn.query(
+      `SELECT producto_id, COALESCE(SUM(cantidad),0) AS cantidad
+         FROM inv_movimiento
+        WHERE compra_id=? AND sede_id=? AND activo=1
+        GROUP BY producto_id`,
+      [id, compra.sede_id]
+    );
+
+    for (const entrada of entradas) {
+      const productoId = Number(entrada.producto_id);
+      const cantidadEntrada = Number(entrada.cantidad || 0);
+      if (cantidadEntrada <= 0) continue;
+
+      // El mismo lock de producto usado por ventas/ajustes evita que cambie el
+      // stock mientras comprobamos si esta compra puede anularse.
+      await conn.query(
+        `SELECT id FROM producto WHERE id=? AND sede_id=? LIMIT 1 FOR UPDATE`,
+        [productoId, compra.sede_id]
+      );
+      const [[stockRow]] = await conn.query(
+        `SELECT COALESCE(SUM(cantidad),0) AS stock
+           FROM inv_movimiento
+          WHERE producto_id=? AND sede_id=? AND activo=1`,
+        [productoId, compra.sede_id]
+      );
+      const stock = Number(stockRow?.stock || 0);
+      if (stock - cantidadEntrada < -0.000001) {
+        throw Object.assign(
+          new Error(`No puedes anular esta compra porque parte de su inventario ya fue vendido o retirado. Producto ${productoId}: stock ${stock}, entrada de la compra ${cantidadEntrada}.`),
+          { httpStatus: 409, code: 'COMPRA_ANULACION_STOCK_INSUFICIENTE' }
+        );
+      }
+    }
+
+    await conn.query(`UPDATE compra SET activo=0 WHERE id=? AND activo=1`, [id]);
+    await conn.query(`UPDATE inv_movimiento SET activo=0 WHERE compra_id=? AND sede_id=?`, [id, compra.sede_id]);
+
     await conn.commit();
-    ok(res, { id, message: r.affectedRows ? 'Compra anulada' : 'Compra no encontrada, ya anulada o fuera de tu sede' });
+    ok(res, { id, message: 'Compra anulada' });
   } catch (e) {
     await conn.rollback();
     throw e;

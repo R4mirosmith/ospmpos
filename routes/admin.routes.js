@@ -10,7 +10,11 @@ const config = require('../config');
 const logoRoot = path.resolve(config.uploads.dir, 'sedes');
 const logoStorage = multer.diskStorage({
   destination: (req, _file, cb) => {
-    const dir = path.join(logoRoot, String(Number(req.params.id)), 'logo');
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id <= 0) {
+      return cb(Object.assign(new Error('Sede inválida'), { httpStatus: 400, code: 'SEDE_INVALIDA' }));
+    }
+    const dir = path.join(logoRoot, String(id), 'logo');
     fs.mkdirSync(dir, { recursive: true });
     cb(null, dir);
   },
@@ -23,8 +27,15 @@ const logoUpload = multer({
   storage: logoStorage,
   limits: { fileSize: 5 * 1024 * 1024 },
   fileFilter: (_req, file, cb) => {
-    if (!String(file.mimetype || '').startsWith('image/')) {
-      return cb(Object.assign(new Error('El logo debe ser una imagen'), { httpStatus: 400, code: 'INVALID_IMAGE' }));
+    const mime = String(file.mimetype || '').toLowerCase();
+    const ext = path.extname(file.originalname || '').toLowerCase();
+    const allowed = new Map([
+      ['image/jpeg', new Set(['.jpg', '.jpeg'])],
+      ['image/png', new Set(['.png'])],
+      ['image/webp', new Set(['.webp'])],
+    ]);
+    if (!allowed.has(mime) || !allowed.get(mime).has(ext)) {
+      return cb(Object.assign(new Error('El logo debe ser JPG, PNG o WEBP'), { httpStatus: 400, code: 'INVALID_IMAGE' }));
     }
     cb(null, true);
   },

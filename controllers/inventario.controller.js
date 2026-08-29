@@ -65,6 +65,19 @@ async function ajuste(req, res) {
     // Nunca usamos Math.abs() para una entrada porque eso convertía -2 en +2.
     const tipo = cantidad < 0 ? 'OUT_AJUSTE' : 'IN_AJUSTE';
 
+    // No permitimos que un ajuste de salida deje existencias negativas.
+    // Ventas y ajustes bloquean primero la fila del producto, así las operaciones
+    // concurrentes del mismo producto quedan serializadas dentro de la transacción.
+    if (cantidad < 0) {
+      const actual = await stockActual(conn, productoId, s.sede_id);
+      if (actual + cantidad < -0.000001) {
+        throw Object.assign(
+          new Error(`El ajuste dejaría stock negativo. Disponible: ${actual}.`),
+          { httpStatus: 409, code: 'STOCK_INSUFICIENTE' }
+        );
+      }
+    }
+
     const [r] = await conn.query(
       `INSERT INTO inv_movimiento(
           empresa_id,sede_id,producto_id,usuario_id,tipo,cantidad,

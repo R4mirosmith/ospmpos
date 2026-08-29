@@ -4,6 +4,7 @@ const { pool, pageLimit } = require('../utils/sql');
 const { ok, created, badRequest, notFound } = require('../utils/http');
 const { writeScope, addScopeWhere, clean, toInt } = require('../utils/scope');
 const config = require('../config');
+const { MAX_VIDEO_SECONDS, videoDurationSeconds } = require('../utils/video');
 
 function stockExpr(alias = 'p') {
   return `(SELECT COALESCE(SUM(m.cantidad),0) FROM inv_movimiento m WHERE m.producto_id=${alias}.id AND m.sede_id=${alias}.sede_id AND m.activo=1)`;
@@ -21,7 +22,7 @@ async function productoEnScope(req, productoId) {
 async function imagenEnScope(req, imagenId) {
   const scope = addScopeWhere(req, 'p');
   const [rows] = await pool.query(
-    `SELECT pi.id, pi.producto_id
+    `SELECT pi.id, pi.producto_id, pi.url, pi.es_principal
        FROM producto_imagen pi
        JOIN producto p ON p.id = pi.producto_id
       WHERE pi.id=? ${scope.where.length ? 'AND ' + scope.where.join(' AND ') : ''}
@@ -216,7 +217,27 @@ async function imgEliminar(req, res) {
   const imgId = Number(req.params.imgId);
   const img = await imagenEnScope(req, imgId);
   if (!img) return notFound(res, 'Imagen no encontrada en la sede activa');
-  await pool.query(`DELETE FROM producto_imagen WHERE id=?`, [imgId]);
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    await conn.query(`DELETE FROM producto_imagen WHERE id=?`, [imgId]);
+    if (Number(img.es_principal) === 1) {
+      const [[next]] = await conn.query(
+        `SELECT id FROM producto_imagen WHERE producto_id=? ORDER BY orden ASC, id ASC LIMIT 1`,
+        [img.producto_id]
+      );
+      if (next?.id) await conn.query(`UPDATE producto_imagen SET es_principal=1 WHERE id=?`, [next.id]);
+    }
+    await conn.commit();
+  } catch (e) {
+    await conn.rollback();
+    throw e;
+  } finally {
+    conn.release();
+  }
+
+  borrarArchivoSilencioso(localImageFileFromUrl(img.producto_id, img.url));
   ok(res, { id: imgId });
 }
 
@@ -269,7 +290,7 @@ async function imgUpload(req, res) {
     }
 
     await conn.commit();
-    created(res, { uploaded });
+    created(res, { uploaded, items: uploaded });
   } catch (e) {
     await conn.rollback();
     limpiarArchivosSubidos(files);
@@ -279,18 +300,111 @@ async function imgUpload(req, res) {
   }
 }
 
+function localImageFileFromUrl(productoId, url) {
+  const value = String(url || '');
+  const prefix = `/productos/${productoId}/imagenes/public/`;
+  if (!value.startsWith(prefix)) return null;
+  const name = path.basename(value.slice(prefix.length));
+  if (!name) return null;
+  return path.resolve(config.uploads.dir, 'products', String(productoId), name);
+}
+
+function localVideoFileFromUrl(productoId, url) {
+  const value = String(url || '');
+  const prefix = `/productos/${productoId}/video/public/`;
+  if (!value.startsWith(prefix)) return null;
+  const name = path.basename(value.slice(prefix.length));
+  if (!name) return null;
+  return path.resolve(config.uploads.dir, 'products', String(productoId), 'video', name);
+}
+
+function borrarArchivoSilencioso(filePath) {
+  if (!filePath) return;
+  try { fs.unlinkSync(filePath); } catch { /* ya no existe */ }
+}
+
+async function videoUpload(req, res) {
+  const id = Number(req.params.id);
+  const file = req.file;
+  if (!file) return badRequest(res, 'No se subió ningún video');
+
+  const producto = await productoEnScope(req, id);
+  if (!producto) {
+    borrarArchivoSilencioso(file.path);
+    return notFound(res, 'Producto no encontrado en la sede activa');
+  }
+
+  let duration;
+  try {
+    duration = videoDurationSeconds(file.path);
+  } catch {
+    borrarArchivoSilencioso(file.path);
+    return badRequest(res, 'No fue posible leer la duración del video. Usa un MP4 o MOV válido.');
+  }
+
+  if (duration === null) {
+    borrarArchivoSilencioso(file.path);
+    return badRequest(res, 'No fue posible leer la duración del video. Usa un MP4 o MOV válido.');
+  }
+  if (duration <= 0 || duration > MAX_VIDEO_SECONDS + 0.05) {
+    borrarArchivoSilencioso(file.path);
+    return badRequest(res, `El video debe durar máximo ${MAX_VIDEO_SECONDS} segundos. Duración detectada: ${duration.toFixed(2)} s.`);
+  }
+
+  const [[actual]] = await pool.query(`SELECT video_url FROM producto WHERE id=? AND sede_id=? LIMIT 1`, [id, producto.sede_id]);
+  const previousFile = localVideoFileFromUrl(id, actual?.video_url);
+  const publicPath = `/productos/${id}/video/public/${path.basename(file.filename)}`;
+
+  try {
+    await pool.query(
+      `UPDATE producto SET video_url=?, video_duracion_segundos=?, video_mime=?, fecha=UTC_TIMESTAMP() WHERE id=? AND sede_id=?`,
+      [publicPath, Number(duration.toFixed(3)), file.mimetype, id, producto.sede_id]
+    );
+  } catch (e) {
+    borrarArchivoSilencioso(file.path);
+    throw e;
+  }
+
+  if (previousFile && path.resolve(previousFile) !== path.resolve(file.path)) borrarArchivoSilencioso(previousFile);
+  created(res, { id, video_url: publicPath, video_duracion_segundos: Number(duration.toFixed(3)), video_mime: file.mimetype });
+}
+
+async function videoEliminar(req, res) {
+  const id = Number(req.params.id);
+  const producto = await productoEnScope(req, id);
+  if (!producto) return notFound(res, 'Producto no encontrado en la sede activa');
+
+  const [[actual]] = await pool.query(`SELECT video_url FROM producto WHERE id=? AND sede_id=? LIMIT 1`, [id, producto.sede_id]);
+  const previousFile = localVideoFileFromUrl(id, actual?.video_url);
+  await pool.query(
+    `UPDATE producto SET video_url=NULL, video_duracion_segundos=NULL, video_mime=NULL, fecha=UTC_TIMESTAMP() WHERE id=? AND sede_id=?`,
+    [id, producto.sede_id]
+  );
+  borrarArchivoSilencioso(previousFile);
+  ok(res, { id, message: 'Video eliminado' });
+}
+
 async function webCatalogo(req, res) { return publicCatalogo(req, res); }
 async function webProducto(req, res) { return publicProducto(req, res); }
 async function publicCatalogo(req, res) {
   const sedeId = Number(req.query.sede_id || config.public.defaultSedeId || 1);
   const [items] = await pool.query(
-    `SELECT p.id, p.codigo, p.nombre, p.descripcion, p.precio, p.precio_m, ${stockExpr('p')} stock,
+    `SELECT p.id, p.codigo, p.nombre, p.descripcion, p.precio, p.precio_m, p.video_url, p.video_duracion_segundos, ${stockExpr('p')} stock,
             (SELECT pi.url FROM producto_imagen pi WHERE pi.producto_id=p.id ORDER BY pi.es_principal DESC, pi.orden ASC, pi.id ASC LIMIT 1) imagen
        FROM producto p WHERE p.sede_id=? AND p.activo=1 ORDER BY p.nombre`, [sedeId]);
   ok(res, { total: items.length, items });
 }
 async function publicProducto(req, res) {
-  const [rows] = await pool.query(`SELECT p.*, ${stockExpr('p')} stock FROM producto p WHERE p.id=? AND p.activo=1`, [Number(req.params.id)]);
+  const sedeId = Number(req.query.sede_id || config.public.defaultSedeId || 1);
+  const [rows] = await pool.query(
+    `SELECT p.id, p.codigo, p.nombre, p.descripcion, p.garantia_info, p.precio, p.precio_m, p.categoria_id,
+            p.video_url, p.video_duracion_segundos, ${stockExpr('p')} stock,
+            (SELECT pi.url FROM producto_imagen pi WHERE pi.producto_id=p.id ORDER BY pi.es_principal DESC, pi.orden ASC, pi.id ASC LIMIT 1) imagen
+       FROM producto p
+      WHERE p.id=? AND p.sede_id=? AND p.activo=1
+      LIMIT 1`,
+    [Number(req.params.id), sedeId]
+  );
   ok(res, rows[0] || null);
 }
-module.exports = { listar, get, crear, actualizar, estado, cambiarEstado: estado, imgAgregar, imgListar, imgSetPrincipal, imgReordenar, imgEliminar, imgUpload, webCatalogo, webProducto, publicCatalogo, publicProducto };
+module.exports = { listar, get, crear, actualizar, estado, cambiarEstado: estado, imgAgregar, imgListar, imgSetPrincipal, imgReordenar, imgEliminar, imgUpload, videoUpload, videoEliminar, webCatalogo, webProducto, publicCatalogo, publicProducto };

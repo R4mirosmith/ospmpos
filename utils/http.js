@@ -17,6 +17,16 @@ function notFound(res, message = 'Registro no encontrado') { return fail(res, 40
 
 function errorHandler(err, _req, res, _next) {
   console.error(err);
+
+  if (err?.name === 'MulterError') {
+    const messages = {
+      LIMIT_FILE_SIZE: 'El archivo supera el tamaño máximo permitido',
+      LIMIT_FILE_COUNT: 'Se enviaron más archivos de los permitidos',
+      LIMIT_UNEXPECTED_FILE: 'Campo de archivo no permitido',
+    };
+    return fail(res, 400, messages[err.code] || err.message || 'Archivo inválido', err.code || 'UPLOAD_ERROR');
+  }
+
   const message = err?.sqlMessage || err?.message || 'Error inesperado';
   return fail(res, err?.httpStatus || 500, message, err?.code || 'INTERNAL_ERROR');
 }
