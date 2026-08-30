@@ -257,6 +257,154 @@ async function testAnularCompraNoDejaStockNegativo() {
   assert.strictEqual(rolledBack, true);
 }
 
+
+async function testGestorWebConfirmarNoDescuentaInventario() {
+  let getConnectionCalled = false;
+  let updated = false;
+  fakePool.getConnection = async () => {
+    getConnectionCalled = true;
+    throw new Error('Confirmar no debe abrir una transacción de venta');
+  };
+  fakePool.query = async (sql, params) => {
+    if (/SELECT p\.id_pedido_web, p\.empresa_id/i.test(sql)) {
+      return [[{
+        id_pedido_web: 12,
+        empresa_id: 1,
+        sede_id: 2,
+        venta_id: null,
+        estado: 'PENDIENTE',
+      }]];
+    }
+    if (/UPDATE pedidos_web p/i.test(sql)) {
+      updated = true;
+      assert.strictEqual(params[0], 'CONFIRMADO');
+      return [{ affectedRows: 1 }];
+    }
+    throw new Error(`SQL inesperado confirmar GESTOR_WEB: ${sql}`);
+  };
+
+  const req = reqBase({ observacion_interna: 'Cliente validado' });
+  req.user.role = 'GESTOR_WEB';
+  req.params.id = '12';
+  const res = resMock();
+
+  await pedidosWeb.confirmar(req, res);
+
+  assert.strictEqual(res.statusCode, 200);
+  assert.strictEqual(res.body.result.estado, 'CONFIRMADO');
+  assert.strictEqual(res.body.result.venta_id, null);
+  assert.strictEqual(updated, true);
+  assert.strictEqual(getConnectionCalled, false);
+}
+
+async function testGestorWebFacturarCreaVentaWebYDescuentaStockUnaVez() {
+  activeSedePool();
+  let committed = false;
+  let rolledBack = false;
+  let inventoryMovements = 0;
+  let facturado = false;
+  let ventaCanalWeb = false;
+
+  fakePool.getConnection = async () => ({
+    beginTransaction: async () => {},
+    commit: async () => { committed = true; },
+    rollback: async () => { rolledBack = true; },
+    release: () => {},
+    query: async (sql, params) => {
+      if (/FROM pedidos_web\s+WHERE id_pedido_web/i.test(sql)) {
+        return [[{
+          id_pedido_web: 12,
+          empresa_id: 1,
+          sede_id: 2,
+          venta_id: null,
+          estado: 'CONFIRMADO',
+          cliente_direccion: 'Calle 1',
+        }]];
+      }
+      if (/FROM pedidos_web_detalle/i.test(sql)) {
+        return [[{
+          id_pedido_web_detalle: 1,
+          producto_id: 10,
+          nombre_producto: 'Producto web',
+          precio: 25000,
+          cantidad: 2,
+          subtotal: 50000,
+        }]];
+      }
+      if (/FROM cliente/i.test(sql)) return [[{ id: 9 }]];
+      if (/INSERT INTO venta\(/i.test(sql)) {
+        ventaCanalWeb = /'WEB'/i.test(sql);
+        return [{ insertId: 120 }];
+      }
+      if (/SELECT id,nombre,codigo FROM producto/i.test(sql)) {
+        return [[{ id: 10, nombre: 'Producto web', codigo: 'PW10' }]];
+      }
+      if (/SELECT COALESCE\(SUM\(cantidad\),0\) stock/i.test(sql)) return [[{ stock: 7 }]];
+      if (/INSERT INTO venta_detalle/i.test(sql)) return [{ insertId: 1 }];
+      if (/INSERT INTO inv_movimiento/i.test(sql)) {
+        inventoryMovements += 1;
+        assert.strictEqual(Number(params[6]), -2);
+        return [{ insertId: 1 }];
+      }
+      if (/UPDATE venta SET subtotal=/i.test(sql)) return [{ affectedRows: 1 }];
+      if (/UPDATE pedidos_web/i.test(sql) && /estado='FACTURADO'/i.test(sql)) {
+        facturado = true;
+        return [{ affectedRows: 1 }];
+      }
+      throw new Error(`SQL inesperado facturar GESTOR_WEB: ${sql}`);
+    },
+  });
+
+  const req = reqBase({ observacion_interna: 'Facturado desde gestión web' });
+  req.user.role = 'GESTOR_WEB';
+  req.params.id = '12';
+  const res = resMock();
+
+  await pedidosWeb.facturar(req, res);
+
+  assert.strictEqual(res.statusCode, 201);
+  assert.strictEqual(res.body.result.venta_id, 120);
+  assert.strictEqual(res.body.result.canal, 'WEB');
+  assert.strictEqual(res.body.result.estado_pedido, 'FACTURADO');
+  assert.strictEqual(inventoryMovements, 1);
+  assert.strictEqual(facturado, true);
+  assert.strictEqual(ventaCanalWeb, true);
+  assert.strictEqual(committed, true);
+  assert.strictEqual(rolledBack, false);
+}
+
+async function testGestorWebSoloListaSusVentasWeb() {
+  const consultas = [];
+  fakePool.query = async (sql, params) => {
+    consultas.push({ sql, params });
+    if (/SELECT COUNT\(\*\) total/i.test(sql)) return [[{ total: 1 }]];
+    if (/SELECT v\.id venta_id/i.test(sql)) {
+      return [[{
+        venta_id: 120,
+        id_pedido_web: 12,
+        total: 50000,
+        canal: 'WEB',
+        pedido_estado: 'FACTURADO',
+      }]];
+    }
+    throw new Error(`SQL inesperado ventas web: ${sql}`);
+  };
+
+  const req = reqBase({});
+  req.user.role = 'GESTOR_WEB';
+  req.user.id = 7;
+  req.query = { page: 1, pageSize: 20 };
+  const res = resMock();
+  await pedidosWeb.ventasRealizadas(req, res);
+
+  assert.strictEqual(res.statusCode, 200);
+  assert.strictEqual(res.body.result.total, 1);
+  assert.strictEqual(res.body.result.items[0].canal, 'WEB');
+  assert(consultas.every(({ sql }) => /v\.canal='WEB'/i.test(sql)));
+  assert(consultas.every(({ sql }) => /v\.usuario_id=\?/i.test(sql)));
+  assert(consultas.every(({ params }) => params.map(Number).includes(7)));
+}
+
 async function testVentaRechazaPrecioManipulado() {
   activeSedePool();
   let inventoryInserted = false;
@@ -291,6 +439,9 @@ const tests = [
   testAnularVentaRevierteVentaYDevolucion,
   testPedidoFacturadoEsIdempotente,
   testPedidoSinStockHaceRollback,
+  testGestorWebConfirmarNoDescuentaInventario,
+  testGestorWebFacturarCreaVentaWebYDescuentaStockUnaVez,
+  testGestorWebSoloListaSusVentasWeb,
   testAjusteNegativoNoPermiteStockMenorACero,
   testAnularCompraNoDejaStockNegativo,
   testVentaRechazaPrecioManipulado,

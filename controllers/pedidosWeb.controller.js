@@ -7,6 +7,15 @@ function num(v, def = 0) {
   return Number.isFinite(n) ? n : def;
 }
 
+function isGestorWeb(req) {
+  return String(req.user?.role || '').toUpperCase() === 'GESTOR_WEB';
+}
+
+function estadoPedidoPublico(estado) {
+  // Compatibilidad con pedidos facturados por versiones anteriores.
+  return String(estado || '').toUpperCase() === 'CONVERTIDO' ? 'FACTURADO' : String(estado || '').toUpperCase();
+}
+
 async function consumidorFinal(conn, scope) {
   const [[existente]] = await conn.query(
     `SELECT id
@@ -34,8 +43,14 @@ async function listar(req, res) {
   const params = [...scope.params];
 
   if (clean(req.query.estado)) {
-    where.push('p.estado=?');
-    params.push(String(req.query.estado).toUpperCase());
+    const estado = String(req.query.estado).toUpperCase();
+    if (estado === 'FACTURADO' || estado === 'CONVERTIDO') {
+      // CONVERTIDO era el nombre usado antes de separar Confirmar y Facturar.
+      where.push("p.estado IN ('FACTURADO','CONVERTIDO')");
+    } else {
+      where.push('p.estado=?');
+      params.push(estado);
+    }
   }
   if (clean(req.query.buscar)) {
     where.push('(p.cliente_nombre LIKE ? OR p.cliente_telefono LIKE ? OR p.cliente_barrio LIKE ?)');
@@ -44,7 +59,7 @@ async function listar(req, res) {
 
   const sql = where.length ? `WHERE ${where.join(' AND ')}` : '';
   const [[cnt]] = await pool.query(`SELECT COUNT(*) total FROM pedidos_web p ${sql}`, params);
-  const [items] = await pool.query(
+  const [rows] = await pool.query(
     `SELECT p.*, s.nombre sede_nombre, e.nombre empresa_nombre,
             (SELECT COUNT(*) FROM pedidos_web_detalle d WHERE d.pedido_web_id=p.id_pedido_web) cantidad_items
        FROM pedidos_web p
@@ -55,6 +70,7 @@ async function listar(req, res) {
       LIMIT ? OFFSET ?`,
     [...params, limit, offset]
   );
+  const items = rows.map((item) => ({ ...item, estado: estadoPedidoPublico(item.estado) }));
   ok(res, { items, total: Number(cnt.total || 0) });
 }
 
@@ -70,15 +86,77 @@ async function get(req, res) {
     [id, ...scope.params]
   );
   if (!pedido) return notFound(res, 'Pedido no encontrado en tu sede');
+  pedido.estado = estadoPedidoPublico(pedido.estado);
   const [items] = await pool.query(`SELECT * FROM pedidos_web_detalle WHERE pedido_web_id=?`, [id]);
   ok(res, { pedido, items });
+}
+
+async function ventasRealizadas(req, res) {
+  const { limit, offset } = pageLimit(req.query.page, req.query.pageSize);
+  const scope = addScopeWhere(req, 'v');
+  const where = [...scope.where, "v.canal='WEB'", 'v.activo=1', 'p.venta_id=v.id'];
+  const params = [...scope.params];
+
+  // El gestor web ve solamente las ventas WEB que él mismo facturó.
+  if (isGestorWeb(req)) {
+    where.push('v.usuario_id=?');
+    params.push(Number(req.user.id));
+  }
+
+  const q = clean(req.query.buscar || req.query.q);
+  if (q) {
+    where.push('(p.cliente_nombre LIKE ? OR p.cliente_telefono LIKE ? OR CAST(v.id AS CHAR) LIKE ? OR CAST(p.id_pedido_web AS CHAR) LIKE ?)');
+    params.push(`%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`);
+  }
+
+  const sql = `WHERE ${where.join(' AND ')}`;
+  const [[cnt]] = await pool.query(
+    `SELECT COUNT(*) total
+       FROM venta v
+       JOIN pedidos_web p ON p.venta_id=v.id
+       ${sql}`,
+    params
+  );
+
+  const [items] = await pool.query(
+    `SELECT v.id venta_id,
+            v.fecha,
+            v.total,
+            v.pagado,
+            v.saldo,
+            v.estado venta_estado,
+            v.canal,
+            p.id_pedido_web,
+            p.cliente_nombre,
+            p.cliente_telefono,
+            p.cliente_barrio,
+            p.cliente_direccion,
+            p.estado pedido_estado,
+            (SELECT COUNT(*) FROM venta_detalle vd WHERE vd.venta_id=v.id) items
+       FROM venta v
+       JOIN pedidos_web p ON p.venta_id=v.id
+       ${sql}
+      ORDER BY v.id DESC
+      LIMIT ? OFFSET ?`,
+    [...params, limit, offset]
+  );
+
+  ok(res, {
+    items: items.map((item) => ({ ...item, pedido_estado: estadoPedidoPublico(item.pedido_estado) })),
+    total: Number(cnt.total || 0),
+  });
 }
 
 async function cambiarEstado(req, res) {
   const id = Number(req.params.id);
   const estado = String(req.body?.estado || '').toUpperCase();
+  // FACTURADO solo puede generarlo el endpoint de facturación porque allí se crea
+  // la venta y se descuenta inventario dentro de la misma transacción.
   const permitidos = new Set(['PENDIENTE', 'CONFIRMADO', 'CANCELADO', 'CONVERTIDO']);
-  if (!permitidos.has(estado)) return badRequest(res, 'Estado de pedido inválido');
+  if (!permitidos.has(estado)) {
+    if (estado === 'FACTURADO') return badRequest(res, 'Usa la opción Facturar para completar el pedido y descontar inventario');
+    return badRequest(res, 'Estado de pedido inválido');
+  }
 
   const scope = addScopeWhere(req, 'p');
   const [[actual]] = await pool.query(
@@ -90,8 +168,13 @@ async function cambiarEstado(req, res) {
   );
   if (!actual) return notFound(res, 'Pedido no encontrado en tu sede');
 
-  // Una conversión debe crear la venta y descontar inventario dentro de la misma
-  // transacción. Impedimos marcar CONVERTIDO manualmente y reabrir pedidos ya facturados.
+  const estadoActual = estadoPedidoPublico(actual.estado);
+  if (estadoActual === 'FACTURADO' && estado !== 'CONVERTIDO') {
+    return badRequest(res, 'El pedido ya está facturado y no puede volver a cambiar de estado');
+  }
+
+  // Compatibilidad con una PWA anterior que creaba la venta y luego enviaba venta_id
+  // para marcar CONVERTIDO. Las versiones actuales deben usar /facturar.
   const ventaIdSolicitada = req.body?.venta_id ? Number(req.body.venta_id) : null;
   if (estado === 'CONVERTIDO' && !actual.venta_id && !ventaIdSolicitada) {
     return badRequest(res, 'Usa la opción Facturar para convertir el pedido en venta');
@@ -103,9 +186,6 @@ async function cambiarEstado(req, res) {
     return badRequest(res, 'El pedido ya está facturado. Gestiona la venta asociada en lugar de cambiar el pedido.');
   }
 
-  // Compatibilidad de despliegue: una PWA anterior puede haber creado la venta con
-  // el flujo de dos llamadas y luego enviar venta_id al marcar CONVERTIDO. Validamos
-  // que esa venta pertenezca realmente a la misma sede antes de asociarla.
   if (estado === 'CONVERTIDO' && !actual.venta_id && ventaIdSolicitada) {
     const [[venta]] = await pool.query(
       `SELECT id FROM venta WHERE id=? AND empresa_id=? AND sede_id=? AND activo=1 LIMIT 1`,
@@ -121,23 +201,23 @@ async function cambiarEstado(req, res) {
             p.observacion_interna=?,
             p.usuario_actualiza_id=?,
             p.venta_id=COALESCE(?,p.venta_id),
-            p.fecha_confirmacion=CASE WHEN ?='CONFIRMADO' THEN UTC_TIMESTAMP() ELSE p.fecha_confirmacion END,
+            p.fecha_confirmacion=CASE WHEN ?='CONFIRMADO' THEN COALESCE(p.fecha_confirmacion, UTC_TIMESTAMP()) ELSE p.fecha_confirmacion END,
             p.fecha_cancelacion=CASE WHEN ?='CANCELADO' THEN UTC_TIMESTAMP() ELSE p.fecha_cancelacion END,
             p.fecha_conversion=CASE WHEN ?='CONVERTIDO' THEN UTC_TIMESTAMP() ELSE p.fecha_conversion END
       WHERE p.id_pedido_web=? ${scope.where.length ? 'AND ' + scope.where.join(' AND ') : ''}`,
     [estado, req.body?.observacion_interna || null, req.user.id, ventaId, estado, estado, estado, id, ...scope.params]
   );
   if (!r.affectedRows) return notFound(res, 'Pedido no encontrado en tu sede');
-  ok(res, { id_pedido_web: id, estado, venta_id: ventaId });
+  ok(res, { id_pedido_web: id, estado: estadoPedidoPublico(estado), venta_id: ventaId });
 }
 
 async function confirmar(req, res) {
-  req.body.estado = 'CONFIRMADO';
+  req.body = { ...(req.body || {}), estado: 'CONFIRMADO' };
   return cambiarEstado(req, res);
 }
 
 async function cancelar(req, res) {
-  req.body.estado = 'CANCELADO';
+  req.body = { ...(req.body || {}), estado: 'CANCELADO' };
   return cambiarEstado(req, res);
 }
 
@@ -165,7 +245,7 @@ async function facturar(req, res) {
     // sin volver a descontar inventario.
     if (pedido.venta_id) {
       const [[ventaExistente]] = await conn.query(
-        `SELECT id, subtotal, total, saldo, cliente_id FROM venta WHERE id=? AND sede_id=? LIMIT 1`,
+        `SELECT id, subtotal, total, saldo, cliente_id, canal FROM venta WHERE id=? AND sede_id=? LIMIT 1`,
         [pedido.venta_id, s.sede_id]
       );
       if (!ventaExistente) {
@@ -181,11 +261,14 @@ async function facturar(req, res) {
         subtotal: num(ventaExistente.subtotal),
         total: num(ventaExistente.total),
         saldo: num(ventaExistente.saldo),
+        canal: String(ventaExistente.canal || 'WEB').toUpperCase(),
+        estado_pedido: 'FACTURADO',
         already_converted: true,
       });
     }
 
-    if (String(pedido.estado).toUpperCase() !== 'CONFIRMADO') {
+    // Confirmar NO descuenta stock. Solo un pedido confirmado puede facturarse.
+    if (String(pedido.estado || '').toUpperCase() !== 'CONFIRMADO') {
       throw Object.assign(new Error('Primero confirma el pedido antes de facturarlo'), {
         httpStatus: 400,
         code: 'PEDIDO_NO_CONFIRMADO',
@@ -263,24 +346,29 @@ async function facturar(req, res) {
             empresa_id,sede_id,producto_id,usuario_id,tipo,venta_id,cantidad,
             costo_unitario,comentario,fecha,activo
          ) VALUES(?,?,?,?,?,?,?,?,?,UTC_TIMESTAMP(),1)`,
-        [s.empresa_id, s.sede_id, productoId, req.user.id, 'OUT_VENTA', ventaId, -cantidad, 0, `Venta ${ventaId} / Pedido web ${id}`]
+        [s.empresa_id, s.sede_id, productoId, req.user.id, 'OUT_VENTA', ventaId, -cantidad, 0, `Venta WEB ${ventaId} / Pedido web ${id}`]
       );
     }
 
     subtotal = +subtotal.toFixed(2);
     await conn.query(
-      `UPDATE venta SET subtotal=?, total=?, saldo=? WHERE id=?`,
+      `UPDATE venta SET subtotal=?, total=?, saldo=?, canal='WEB' WHERE id=?`,
       [subtotal, subtotal, subtotal, ventaId]
     );
 
     const observacion = [
-      `Pedido web facturado. Venta #${ventaId}.`,
+      `Pedido web facturado. Venta WEB #${ventaId}.`,
       clean(req.body?.observacion_interna),
     ].filter(Boolean).join(' ');
 
     await conn.query(
       `UPDATE pedidos_web
-          SET estado='CONVERTIDO', venta_id=?, observacion_interna=?, usuario_actualiza_id=?, fecha_conversion=UTC_TIMESTAMP()
+          SET estado='FACTURADO',
+              venta_id=?,
+              observacion_interna=?,
+              usuario_actualiza_id=?,
+              fecha_confirmacion=COALESCE(fecha_confirmacion, UTC_TIMESTAMP()),
+              fecha_conversion=UTC_TIMESTAMP()
         WHERE id_pedido_web=? AND empresa_id=? AND sede_id=?`,
       [ventaId, observacion || null, req.user.id, id, s.empresa_id, s.sede_id]
     );
@@ -292,6 +380,8 @@ async function facturar(req, res) {
       subtotal,
       total: subtotal,
       saldo: subtotal,
+      canal: 'WEB',
+      estado_pedido: 'FACTURADO',
       pedido_web_id: id,
     });
   } catch (e) {
@@ -302,4 +392,4 @@ async function facturar(req, res) {
   }
 }
 
-module.exports = { listar, get, cambiarEstado, confirmar, cancelar, facturar };
+module.exports = { listar, get, ventasRealizadas, cambiarEstado, confirmar, cancelar, facturar };

@@ -38,6 +38,11 @@ function run(method, requestPath, role) {
 assert.strictEqual(run('GET', '/api/productos', 'GESTOR_WEB').nextCalled, true);
 assert.strictEqual(run('PATCH', '/api/productos/1', 'GESTOR_WEB').nextCalled, true);
 assert.strictEqual(run('GET', '/api/pedidos-web', 'GESTOR_WEB').nextCalled, true);
+assert.strictEqual(run('PATCH', '/api/pedidos-web/1/confirmar', 'GESTOR_WEB').nextCalled, true);
+assert.strictEqual(run('PATCH', '/api/pedidos-web/1/cancelar', 'GESTOR_WEB').nextCalled, true);
+assert.strictEqual(run('PATCH', '/api/pedidos-web/1/estado', 'GESTOR_WEB').nextCalled, true);
+assert.strictEqual(run('POST', '/api/pedidos-web/1/facturar', 'GESTOR_WEB').nextCalled, true);
+assert.strictEqual(run('GET', '/api/pedidos-web/ventas-realizadas', 'GESTOR_WEB').nextCalled, true);
 assert.strictEqual(run('GET', '/api/categorias', 'GESTOR_WEB').nextCalled, true);
 
 let r = run('POST', '/api/categorias', 'GESTOR_WEB');
