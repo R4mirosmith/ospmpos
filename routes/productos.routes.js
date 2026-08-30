@@ -106,21 +106,21 @@ router.get('/web/productos/:id', asyncHandler(ctl.webProducto));
 
 router.use(requireAuth);
 router.get('/', asyncHandler(ctl.listar));
-router.post('/', requireRoles('ADMIN', 'VENDEDOR'), asyncHandler(ctl.crear));
+router.post('/', requireRoles('ADMIN', 'VENDEDOR', 'GESTOR_WEB'), asyncHandler(ctl.crear));
 router.get('/:id', asyncHandler(ctl.get));
-router.patch('/:id', requireRoles('ADMIN', 'VENDEDOR'), asyncHandler(ctl.actualizar));
+router.patch('/:id', requireRoles('ADMIN', 'VENDEDOR', 'GESTOR_WEB'), asyncHandler(ctl.actualizar));
 router.patch('/:id/estado', requireRoles('ADMIN'), asyncHandler(ctl.estado));
 
-router.post('/:id/imagenes', requireRoles('ADMIN', 'VENDEDOR'), asyncHandler(ctl.imgAgregar));
+router.post('/:id/imagenes', requireRoles('ADMIN', 'VENDEDOR', 'GESTOR_WEB'), asyncHandler(ctl.imgAgregar));
 router.get('/:id/imagenes', asyncHandler(ctl.imgListar));
-router.patch('/:id/imagenes/:imgId/principal', requireRoles('ADMIN', 'VENDEDOR'), asyncHandler(ctl.imgSetPrincipal));
-router.post('/:id/imagenes/:imgId/principal', requireRoles('ADMIN', 'VENDEDOR'), asyncHandler(ctl.imgSetPrincipal));
-router.patch('/imagenes/:imgId/orden', requireRoles('ADMIN', 'VENDEDOR'), asyncHandler(ctl.imgReordenar));
-router.post('/imagenes/:imgId/orden', requireRoles('ADMIN', 'VENDEDOR'), asyncHandler(ctl.imgReordenar));
-router.delete('/imagenes/:imgId', requireRoles('ADMIN', 'VENDEDOR'), asyncHandler(ctl.imgEliminar));
-router.post('/:id/imagenes/upload', requireRoles('ADMIN', 'VENDEDOR'), imageUpload.array('images', 3), asyncHandler(ctl.imgUpload));
+router.patch('/:id/imagenes/:imgId/principal', requireRoles('ADMIN', 'VENDEDOR', 'GESTOR_WEB'), asyncHandler(ctl.imgSetPrincipal));
+router.post('/:id/imagenes/:imgId/principal', requireRoles('ADMIN', 'VENDEDOR', 'GESTOR_WEB'), asyncHandler(ctl.imgSetPrincipal));
+router.patch('/imagenes/:imgId/orden', requireRoles('ADMIN', 'VENDEDOR', 'GESTOR_WEB'), asyncHandler(ctl.imgReordenar));
+router.post('/imagenes/:imgId/orden', requireRoles('ADMIN', 'VENDEDOR', 'GESTOR_WEB'), asyncHandler(ctl.imgReordenar));
+router.delete('/imagenes/:imgId', requireRoles('ADMIN', 'VENDEDOR', 'GESTOR_WEB'), asyncHandler(ctl.imgEliminar));
+router.post('/:id/imagenes/upload', requireRoles('ADMIN', 'VENDEDOR', 'GESTOR_WEB'), imageUpload.array('images', 3), asyncHandler(ctl.imgUpload));
 
-router.post('/:id/video/upload', requireRoles('ADMIN', 'VENDEDOR'), videoUpload.single('video'), asyncHandler(ctl.videoUpload));
-router.delete('/:id/video', requireRoles('ADMIN', 'VENDEDOR'), asyncHandler(ctl.videoEliminar));
+router.post('/:id/video/upload', requireRoles('ADMIN', 'VENDEDOR', 'GESTOR_WEB'), videoUpload.single('video'), asyncHandler(ctl.videoUpload));
+router.delete('/:id/video', requireRoles('ADMIN', 'VENDEDOR', 'GESTOR_WEB'), asyncHandler(ctl.videoEliminar));
 
 module.exports = router;

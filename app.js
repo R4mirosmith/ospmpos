@@ -4,6 +4,7 @@ const morgan = require('morgan');
 const path = require('path');
 const config = require('./config');
 const { errorHandler } = require('./utils/http');
+const { gestorWebScope } = require('./middleware/gestorWebScope');
 
 const app = express();
 const configuredCorsOrigins = String(config.server.corsOrigin || '*')
@@ -28,6 +29,7 @@ app.use('/files', express.static(path.resolve(config.uploads.dir)));
 app.get('/api/health', (_req, res) => res.json({ ok: true, ts: new Date().toISOString() }));
 
 app.use('/api/auth', require('./routes/auth.routes'));
+app.use(gestorWebScope);
 app.use('/api/admin', require('./routes/admin.routes'));
 app.use('/api/empresas', require('./routes/empresas.routes'));
 app.use('/api/sedes', require('./routes/sedes.routes'));

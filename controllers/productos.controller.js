@@ -6,6 +6,22 @@ const { writeScope, addScopeWhere, clean, toInt } = require('../utils/scope');
 const config = require('../config');
 const { MAX_VIDEO_SECONDS, videoDurationSeconds } = require('../utils/video');
 
+const ROL_GESTOR_WEB = 'GESTOR_WEB';
+
+function esGestorWeb(req) {
+  return String(req.user?.role || '').toUpperCase() === ROL_GESTOR_WEB;
+}
+
+function ocultarValoresAdministrativos(producto) {
+  if (!producto) return producto;
+  const safe = { ...producto };
+  delete safe.costo;
+  delete safe.costo_promedio;
+  delete safe.precio;
+  delete safe.precio_m;
+  return safe;
+}
+
 function stockExpr(alias = 'p') {
   return `(SELECT COALESCE(SUM(m.cantidad),0) FROM inv_movimiento m WHERE m.producto_id=${alias}.id AND m.sede_id=${alias}.sede_id AND m.activo=1)`;
 }
@@ -52,7 +68,7 @@ async function listar(req, res) {
        LEFT JOIN sede s ON s.id=p.sede_id
        ${w}
        ORDER BY p.id DESC LIMIT ? OFFSET ?`, [...params, limit, offset]);
-  ok(res, { items, total: Number(cnt.total || 0) });
+  ok(res, { items: esGestorWeb(req) ? items.map(ocultarValoresAdministrativos) : items, total: Number(cnt.total || 0) });
 }
 async function get(req, res) {
   const scope = addScopeWhere(req, 'p');
@@ -69,19 +85,23 @@ async function get(req, res) {
       WHERE p.id=? ${scope.where.length ? 'AND ' + scope.where.join(' AND ') : ''}`,
     [Number(req.params.id), ...scope.params]
   );
-  ok(res, rows[0] || null);
+  const producto = rows[0] || null;
+  ok(res, esGestorWeb(req) ? ocultarValoresAdministrativos(producto) : producto);
 }
 async function crear(req, res) {
   const { categoria_id, codigo, nombre, descripcion = '', garantia_info = null, costo = null, costo_promedio = null, precio = 0, precio_m = null, stock_minimo = 0, costoInicial = null, codigo_barras = null } = req.body || {};
   if (!categoria_id || !codigo || !nombre) return badRequest(res, 'categoria_id, codigo y nombre requeridos');
   const s = await writeScope(req);
-  const cost = Number(costo ?? costo_promedio ?? costoInicial ?? 0);
+  const gestorWeb = esGestorWeb(req);
+  // El gestor web puede crear el contenido del catálogo, pero nunca decide valores.
+  // El backend fuerza todos los importes administrativos a cero aunque el cliente intente enviarlos.
+  const cost = gestorWeb ? 0 : Number(costo ?? costo_promedio ?? costoInicial ?? 0);
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
 
-    const precioValor = Number(precio || 0);
-    const precioMValor = precio_m === null || precio_m === undefined || precio_m === '' ? null : Number(precio_m);
+    const precioValor = gestorWeb ? 0 : Number(precio || 0);
+    const precioMValor = gestorWeb ? 0 : (precio_m === null || precio_m === undefined || precio_m === '' ? null : Number(precio_m));
     const stockMinimoValor = Number(stock_minimo || 0);
     const valoresValidos = [cost, precioValor, stockMinimoValor, ...(precioMValor === null ? [] : [precioMValor])].every(Number.isFinite);
     if (!valoresValidos || cost < 0 || precioValor < 0 || stockMinimoValor < 0 || (precioMValor !== null && precioMValor < 0)) {
@@ -113,16 +133,25 @@ async function crear(req, res) {
 }
 async function actualizar(req, res) {
   const id = Number(req.params.id);
+  const body = { ...(req.body || {}) };
+  const gestorWeb = esGestorWeb(req);
 
-  if (req.body?.costo_promedio !== undefined && req.body?.costo === undefined) {
-    req.body.costo = req.body.costo_promedio;
+  if (gestorWeb) {
+    // Defensa en profundidad: estos campos jamás participan del UPDATE para GESTOR_WEB.
+    // Así un producto con valores existentes conserva exactamente esos valores.
+    delete body.costo;
+    delete body.costo_promedio;
+    delete body.precio;
+    delete body.precio_m;
+  } else if (body.costo_promedio !== undefined && body.costo === undefined) {
+    body.costo = body.costo_promedio;
   }
 
   const producto = await productoEnScope(req, id);
   if (!producto) return notFound(res, 'Producto no encontrado en la sede activa');
 
-  if (req.body?.categoria_id !== undefined) {
-    const categoriaId = Number(req.body.categoria_id);
+  if (body.categoria_id !== undefined) {
+    const categoriaId = Number(body.categoria_id);
     const [[categoria]] = await pool.query(
       `SELECT id FROM categoria WHERE id=? AND sede_id=? AND activo=1 LIMIT 1`,
       [categoriaId, producto.sede_id]
@@ -131,18 +160,18 @@ async function actualizar(req, res) {
   }
 
   for (const field of ['costo', 'precio', 'precio_m', 'stock_minimo']) {
-    if (req.body?.[field] === undefined || req.body?.[field] === null || req.body?.[field] === '') continue;
-    const value = Number(req.body[field]);
+    if (body[field] === undefined || body[field] === null || body[field] === '') continue;
+    const value = Number(body[field]);
     if (!Number.isFinite(value) || value < 0) return badRequest(res, `${field} debe ser un valor no negativo`);
   }
 
   const fields = ['categoria_id','codigo','nombre','descripcion','garantia_info','costo','precio','precio_m','stock_minimo','codigo_barras','activo'];
-  const upd = fields.filter(f => req.body?.[f] !== undefined);
+  const upd = fields.filter(f => body[f] !== undefined);
   if (!upd.length) return ok(res, { id });
 
   await pool.query(
     `UPDATE producto SET ${upd.map(f=>`${f}=?`).join(', ')}, fecha=UTC_TIMESTAMP() WHERE id=? AND sede_id=?`,
-    [...upd.map(f=> f==='activo' ? (req.body[f]?1:0) : req.body[f]), id, producto.sede_id]
+    [...upd.map(f=> f==='activo' ? (body[f]?1:0) : body[f]), id, producto.sede_id]
   );
   ok(res, { id, message: 'Producto actualizado' });
 }

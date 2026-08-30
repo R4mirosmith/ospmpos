@@ -59,11 +59,21 @@ async function emitPedidoWebNuevo(payload, context = {}) {
 
   const [targets] = await pool.query(
     `SELECT DISTINCT usuario_id
-       FROM notificacion_config
-      WHERE activo = 1
-        AND tipo = 'PEDIDO_WEB'
-        AND sede_id = ?`,
-    [sedeId]
+       FROM (
+         SELECT nc.usuario_id
+           FROM notificacion_config nc
+          WHERE nc.activo = 1
+            AND nc.tipo = 'PEDIDO_WEB'
+            AND nc.sede_id = ?
+         UNION
+         SELECT u.id AS usuario_id
+           FROM usuario u
+           JOIN usuario_tipo ut ON ut.id = u.usuario_tipo_id AND ut.activo = 1
+           JOIN usuario_sede us ON us.usuario_id = u.id AND us.sede_id = ? AND us.activo = 1
+          WHERE u.activo = 1
+            AND UPPER(ut.tipo) = 'GESTOR_WEB'
+       ) destinatarios`,
+    [sedeId, sedeId]
   );
 
   for (const row of targets) {

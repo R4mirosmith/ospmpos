@@ -372,7 +372,7 @@ CREATE TABLE notificacion_config (
   UNIQUE KEY uq_notif (sede_id, usuario_id, tipo)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
-INSERT INTO usuario_tipo(id,tipo,activo) VALUES (1,'ADMIN',1),(2,'VENDEDOR',1);
+INSERT INTO usuario_tipo(id,tipo,activo) VALUES (1,'ADMIN',1),(2,'VENDEDOR',1),(3,'GESTOR_WEB',1);
 INSERT INTO empresa(id,nombre,nit,activo) VALUES (1,'Grupo Demo / Cliente','000000000',1);
 INSERT INTO sede(id,empresa_id,nombre,razon_social,nit,codigo,direccion,telefono,correo,prefijo_factura,es_principal,activo) VALUES (1,1,'Negocio Principal','Negocio Principal S.A.S.','000000000-0','PRINCIPAL','Dirección principal','3000000000','admin@demo.com','NP',1,1);
 INSERT INTO usuario(id,usuario_tipo_id,nombre,hash_password,email,activo) VALUES (1,1,'Administrador','$s256$0123456789ABCDEF0123456789ABCDEF$B00BDB3F47BE7BDE1183F94793126A7D9F29F46A24BB72352B55378CE773F428','admin@demo.com',1);
