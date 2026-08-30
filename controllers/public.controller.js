@@ -2,6 +2,7 @@ const { pool } = require('../utils/sql');
 const { ok, created, badRequest } = require('../utils/http');
 const { emitPedidoWebNuevo } = require('../realtime');
 const config = require('../config');
+const { attachProductImages } = require('../utils/productFields');
 
 function publicSedeId(req) {
   return Number(req.query.sede_id || config.public.defaultSedeId);
@@ -46,8 +47,8 @@ async function products(req, res) {
 
   if (q) {
     const like = `%${q}%`;
-    where.push('(p.nombre LIKE ? OR p.codigo LIKE ? OR p.descripcion LIKE ? OR c.nombre LIKE ?)');
-    params.push(like, like, like, like);
+    where.push('(p.nombre LIKE ? OR p.codigo LIKE ? OR p.descripcion LIKE ? OR p.colores_disponibles LIKE ? OR c.nombre LIKE ?)');
+    params.push(like, like, like, like, like);
   }
 
   if (onlyAvailable) {
@@ -64,24 +65,23 @@ async function products(req, res) {
     `SELECT
        p.id,
        p.codigo,
+       p.codigo_barras,
        p.nombre,
        p.descripcion,
+       p.garantia_info,
+       p.colores_disponibles,
        p.precio,
        p.precio_m,
        p.video_url,
        p.video_duracion_segundos,
+       p.video_mime,
        p.categoria_id,
        c.nombre AS categoria_nombre,
        (SELECT COALESCE(SUM(m.cantidad),0)
           FROM inv_movimiento m
          WHERE m.producto_id=p.id
            AND m.sede_id=p.sede_id
-           AND m.activo=1) AS stock,
-       (SELECT pi.url
-          FROM producto_imagen pi
-         WHERE pi.producto_id=p.id
-         ORDER BY pi.es_principal DESC, pi.orden ASC, pi.id ASC
-         LIMIT 1) AS imagen
+           AND m.activo=1) AS stock
      FROM producto p
      LEFT JOIN categoria c ON c.id=p.categoria_id
      WHERE ${where.join(' AND ')}
@@ -89,30 +89,29 @@ async function products(req, res) {
     params
   );
 
-  ok(res, items);
+  const enriched = await attachProductImages(pool, items);
+  ok(res, enriched);
 }
 
-// Se conserva el comportamiento estable existente de detalle.
+// Detalle público completo del producto para OSPM Shopping.
+// Expone información comercial, multimedia, stock y colores; nunca costos internos.
 async function productDetail(req, res) {
   const sedeId = publicSedeId(req);
-  const [[p]] = await pool.query(
-    `SELECT p.id, p.codigo, p.nombre, p.descripcion, p.garantia_info, p.precio, p.precio_m,
-            p.categoria_id, c.nombre AS categoria_nombre, p.video_url, p.video_duracion_segundos,
+  const [rows] = await pool.query(
+    `SELECT p.id, p.codigo, p.codigo_barras, p.nombre, p.descripcion, p.garantia_info, p.colores_disponibles,
+            p.precio, p.precio_m, p.categoria_id, c.nombre AS categoria_nombre,
+            p.video_url, p.video_duracion_segundos, p.video_mime,
             (SELECT COALESCE(SUM(m.cantidad),0)
                FROM inv_movimiento m
-              WHERE m.producto_id=p.id AND m.sede_id=p.sede_id AND m.activo=1) AS stock,
-            (SELECT pi.url
-               FROM producto_imagen pi
-              WHERE pi.producto_id=p.id
-              ORDER BY pi.es_principal DESC, pi.orden ASC, pi.id ASC
-              LIMIT 1) AS imagen
+              WHERE m.producto_id=p.id AND m.sede_id=p.sede_id AND m.activo=1) AS stock
        FROM producto p
        LEFT JOIN categoria c ON c.id=p.categoria_id
       WHERE p.id=? AND p.sede_id=? AND p.activo=1
       LIMIT 1`,
     [Number(req.params.id), sedeId]
   );
-  ok(res, p || null);
+  const enriched = await attachProductImages(pool, rows);
+  ok(res, enriched[0] || null);
 }
 
 // IMPORTANTE: se conserva el flujo estable de creación + Socket.IO sin cambios funcionales.

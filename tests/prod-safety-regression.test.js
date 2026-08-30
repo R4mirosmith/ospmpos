@@ -32,6 +32,14 @@ require.cache[configPath] = {
   exports: { uploads: { dir: '/tmp/ospm-test-uploads' }, public: { defaultSedeId: 1 } },
 };
 const productos = require('../controllers/productos.controller');
+const realtimePath = require.resolve(path.join(backendRoot, 'realtime.js'));
+require.cache[realtimePath] = {
+  id: realtimePath,
+  filename: realtimePath,
+  loaded: true,
+  exports: { emitPedidoWebNuevo: async () => {} },
+};
+const publicController = require('../controllers/public.controller');
 
 function resMock() {
   return {
@@ -447,6 +455,7 @@ async function testCrearProductoConVariasImagenesObligatorias() {
     beginTransaction: async () => {}, commit: async () => {}, rollback: async () => {}, release: () => {},
     query: async (sql, params) => {
       if (/SELECT id FROM categoria/i.test(sql)) return [[{ id: 3 }]];
+      if (/SELECT id FROM producto WHERE sede_id=\?/i.test(sql)) return [[]];
       if (/INSERT INTO producto\(/i.test(sql)) {
         productInsertParams = params;
         return [{ insertId: 502 }];
@@ -466,6 +475,7 @@ async function testCrearProductoConVariasImagenesObligatorias() {
   const req = reqBase({
     categoria_id: '3', codigo: 'WEB-IMG', nombre: 'Producto con imágenes', descripcion: 'Prueba',
     costo: '8000', precio: '12000', precio_m: '10000', stock_inicial: '20', stock_minimo: '1',
+    colores_disponibles: JSON.stringify(['Negro', 'Azul']), codigo_autogenerado: '1',
   });
   req.user.role = 'GESTOR_WEB';
   req.files = [
@@ -480,9 +490,10 @@ async function testCrearProductoConVariasImagenesObligatorias() {
   assert.strictEqual(res.body.result.uploaded.length, 3);
   assert.strictEqual(imageInsertCount, 3);
   assert.strictEqual(inventoryInserted, false);
-  assert.strictEqual(Number(productInsertParams[7]), 0);
+  assert.deepStrictEqual(JSON.parse(productInsertParams[7]), ['Negro', 'Azul']);
   assert.strictEqual(Number(productInsertParams[8]), 0);
   assert.strictEqual(Number(productInsertParams[9]), 0);
+  assert.strictEqual(Number(productInsertParams[10]), 0);
 
   const fs = require('fs');
   fs.rmSync('/tmp/ospm-test-uploads/products/502', { recursive: true, force: true });
@@ -496,6 +507,77 @@ async function testCrearProductoConImagenesExigeMinimoUna() {
   await productos.crearConImagenes(req, res);
   assert.strictEqual(res.statusCode, 400);
   assert(/al menos una imagen/i.test(res.body.result.message));
+}
+
+
+
+async function testCrearProductoAutogeneraSkuSiVacio() {
+  fakePool.query = async (sql) => {
+    if (/FROM sede s\s+JOIN empresa/i.test(sql)) {
+      return [[{ id: 2, empresa_id: 1, activo: 1, empresa_activa: 1 }]];
+    }
+    throw new Error(`pool.query inesperado SKU automático: ${sql}`);
+  };
+
+  let inserted = null;
+  fakePool.getConnection = async () => ({
+    beginTransaction: async () => {}, commit: async () => {}, rollback: async () => {}, release: () => {},
+    query: async (sql, params) => {
+      if (/SELECT id FROM categoria/i.test(sql)) return [[{ id: 3 }]];
+      if (/SELECT id FROM producto WHERE sede_id=\?/i.test(sql)) return [[]];
+      if (/INSERT INTO producto\(/i.test(sql)) { inserted = params; return [{ insertId: 700 }]; }
+      if (/INSERT INTO producto_imagen/i.test(sql)) return [{ insertId: 701 }];
+      throw new Error(`SQL inesperado SKU automático: ${sql}`);
+    },
+  });
+
+  const req = reqBase({ categoria_id: '3', codigo: '', nombre: 'iPhone 15 Pro Max', descripcion: 'Prueba', codigo_autogenerado: '1' });
+  req.user.role = 'GESTOR_WEB';
+  req.files = [{ originalname: 'frente.jpg', mimetype: 'image/jpeg', buffer: Buffer.from('img') }];
+  const res = resMock();
+  await productos.crearConImagenes(req, res);
+
+  assert.strictEqual(res.statusCode, 201);
+  assert(/^IPHONE-15-PRO-MAX-\d{15}/.test(String(inserted[3])));
+  assert.strictEqual(res.body.result.codigo, inserted[3]);
+  require('fs').rmSync('/tmp/ospm-test-uploads/products/700', { recursive: true, force: true });
+}
+
+async function testApiPublicaProductoEntregaInformacionCompleta() {
+  fakePool.query = async (sql, params) => {
+    if (/FROM producto p/i.test(sql) && /WHERE p\.id=\?/i.test(sql)) {
+      assert.strictEqual(Number(params[0]), 77);
+      return [[{
+        id: 77, codigo: 'PHONE-260830', codigo_barras: '77000077', nombre: 'Teléfono',
+        descripcion: 'Equipo de prueba', garantia_info: '12 meses',
+        colores_disponibles: JSON.stringify(['Negro', 'Azul']), precio: 900000, precio_m: 850000,
+        categoria_id: 3, categoria_nombre: 'Celulares', video_url: '/productos/77/video/public/demo.mp4',
+        video_duracion_segundos: 12.5, video_mime: 'video/mp4', stock: 4,
+      }]];
+    }
+    if (/FROM producto_imagen/i.test(sql) && /producto_id IN/i.test(sql)) {
+      return [[
+        { id: 1, producto_id: 77, url: '/productos/77/imagenes/public/a.jpg', alt: 'Frente', es_principal: 1, orden: 0 },
+        { id: 2, producto_id: 77, url: '/productos/77/imagenes/public/b.jpg', alt: 'Lado', es_principal: 0, orden: 1 },
+      ]];
+    }
+    throw new Error(`SQL inesperado API pública producto: ${sql}`);
+  };
+
+  const req = reqBase();
+  req.params = { id: '77' };
+  req.query = { sede_id: '2' };
+  const res = resMock();
+  await publicController.productDetail(req, res);
+
+  assert.strictEqual(res.statusCode, 200);
+  const p = res.body.result;
+  assert.deepStrictEqual(p.colores_disponibles, ['Negro', 'Azul']);
+  assert.strictEqual(p.imagenes.length, 2);
+  assert.strictEqual(p.imagen, '/productos/77/imagenes/public/a.jpg');
+  assert.strictEqual(p.video.mime, 'video/mp4');
+  assert.strictEqual(p.garantia_info, '12 meses');
+  assert.strictEqual(Object.prototype.hasOwnProperty.call(p, 'costo'), false);
 }
 
 async function testVentaRechazaPrecioManipulado() {
@@ -538,6 +620,8 @@ const tests = [
   testGestorWebNoPuedeCrearProductoSinImagenPorEndpointJson,
   testCrearProductoConVariasImagenesObligatorias,
   testCrearProductoConImagenesExigeMinimoUna,
+  testCrearProductoAutogeneraSkuSiVacio,
+  testApiPublicaProductoEntregaInformacionCompleta,
   testAjusteNegativoNoPermiteStockMenorACero,
   testAnularCompraNoDejaStockNegativo,
   testVentaRechazaPrecioManipulado,

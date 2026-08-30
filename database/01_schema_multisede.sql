@@ -129,6 +129,7 @@ CREATE TABLE producto (
   nombre VARCHAR(255) NOT NULL,
   descripcion TEXT NULL,
   garantia_info TEXT NULL,
+  colores_disponibles TEXT NULL,
   video_url TEXT NULL,
   video_duracion_segundos DECIMAL(7,3) NULL,
   video_mime VARCHAR(80) NULL,
