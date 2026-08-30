@@ -22,6 +22,17 @@ const ventas = require('../controllers/ventas.controller');
 const pedidosWeb = require('../controllers/pedidosWeb.controller');
 const compras = require('../controllers/compras.controller');
 
+// productos.controller usa config para rutas de uploads; en esta prueba no necesitamos
+// cargar dotenv ni configuración real.
+const configPath = require.resolve(path.join(backendRoot, 'config.js'));
+require.cache[configPath] = {
+  id: configPath,
+  filename: configPath,
+  loaded: true,
+  exports: { uploads: { dir: '/tmp/ospm-test-uploads' }, public: { defaultSedeId: 1 } },
+};
+const productos = require('../controllers/productos.controller');
+
 function resMock() {
   return {
     statusCode: 0,
@@ -405,6 +416,88 @@ async function testGestorWebSoloListaSusVentasWeb() {
   assert(consultas.every(({ params }) => params.map(Number).includes(7)));
 }
 
+
+async function testGestorWebNoPuedeCrearProductoSinImagenPorEndpointJson() {
+  const req = reqBase({
+    categoria_id: 3,
+    codigo: 'WEB-001',
+    nombre: 'Producto web',
+    descripcion: 'Prueba',
+    stock_inicial: 25,
+  });
+  req.user.role = 'GESTOR_WEB';
+  const res = resMock();
+  await productos.crear(req, res);
+  assert.strictEqual(res.statusCode, 400);
+  assert(/al menos una imagen/i.test(res.body.result.message));
+}
+
+async function testCrearProductoConVariasImagenesObligatorias() {
+  fakePool.query = async (sql) => {
+    if (/FROM sede s\s+JOIN empresa/i.test(sql)) {
+      return [[{ id: 2, empresa_id: 1, activo: 1, empresa_activa: 1 }]];
+    }
+    throw new Error(`pool.query inesperado producto con imágenes: ${sql}`);
+  };
+
+  let productInsertParams = null;
+  let imageInsertCount = 0;
+  let inventoryInserted = false;
+  fakePool.getConnection = async () => ({
+    beginTransaction: async () => {}, commit: async () => {}, rollback: async () => {}, release: () => {},
+    query: async (sql, params) => {
+      if (/SELECT id FROM categoria/i.test(sql)) return [[{ id: 3 }]];
+      if (/INSERT INTO producto\(/i.test(sql)) {
+        productInsertParams = params;
+        return [{ insertId: 502 }];
+      }
+      if (/INSERT INTO producto_imagen/i.test(sql)) {
+        imageInsertCount++;
+        return [{ insertId: 600 + imageInsertCount }];
+      }
+      if (/INSERT INTO inv_movimiento/i.test(sql)) {
+        inventoryInserted = true;
+        return [{ insertId: 1 }];
+      }
+      throw new Error(`SQL inesperado producto con imágenes: ${sql}`);
+    },
+  });
+
+  const req = reqBase({
+    categoria_id: '3', codigo: 'WEB-IMG', nombre: 'Producto con imágenes', descripcion: 'Prueba',
+    costo: '8000', precio: '12000', precio_m: '10000', stock_inicial: '20', stock_minimo: '1',
+  });
+  req.user.role = 'GESTOR_WEB';
+  req.files = [
+    { originalname: 'frente.jpg', mimetype: 'image/jpeg', buffer: Buffer.from('img1') },
+    { originalname: 'lado.png', mimetype: 'image/png', buffer: Buffer.from('img2') },
+    { originalname: 'detalle.webp', mimetype: 'image/webp', buffer: Buffer.from('img3') },
+  ];
+  const res = resMock();
+  await productos.crearConImagenes(req, res);
+
+  assert.strictEqual(res.statusCode, 201);
+  assert.strictEqual(res.body.result.uploaded.length, 3);
+  assert.strictEqual(imageInsertCount, 3);
+  assert.strictEqual(inventoryInserted, false);
+  assert.strictEqual(Number(productInsertParams[7]), 0);
+  assert.strictEqual(Number(productInsertParams[8]), 0);
+  assert.strictEqual(Number(productInsertParams[9]), 0);
+
+  const fs = require('fs');
+  fs.rmSync('/tmp/ospm-test-uploads/products/502', { recursive: true, force: true });
+}
+
+async function testCrearProductoConImagenesExigeMinimoUna() {
+  const req = reqBase({ categoria_id: 3, codigo: 'SIN-IMG', nombre: 'Sin imagen' });
+  req.user.role = 'GESTOR_WEB';
+  req.files = [];
+  const res = resMock();
+  await productos.crearConImagenes(req, res);
+  assert.strictEqual(res.statusCode, 400);
+  assert(/al menos una imagen/i.test(res.body.result.message));
+}
+
 async function testVentaRechazaPrecioManipulado() {
   activeSedePool();
   let inventoryInserted = false;
@@ -442,6 +535,9 @@ const tests = [
   testGestorWebConfirmarNoDescuentaInventario,
   testGestorWebFacturarCreaVentaWebYDescuentaStockUnaVez,
   testGestorWebSoloListaSusVentasWeb,
+  testGestorWebNoPuedeCrearProductoSinImagenPorEndpointJson,
+  testCrearProductoConVariasImagenesObligatorias,
+  testCrearProductoConImagenesExigeMinimoUna,
   testAjusteNegativoNoPermiteStockMenorACero,
   testAnularCompraNoDejaStockNegativo,
   testVentaRechazaPrecioManipulado,

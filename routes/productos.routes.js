@@ -50,23 +50,35 @@ const imageStorage = multer.diskStorage({
   filename: (_req, file, cb) => cb(null, `${Date.now()}-${path.basename(file.originalname).replace(/[^a-zA-Z0-9._-]/g, '_')}`),
 });
 
+function imageFileFilter(_req, file, cb) {
+  const mime = String(file.mimetype || '').toLowerCase();
+  const ext = path.extname(file.originalname || '').toLowerCase();
+  const allowed = new Map([
+    ['image/jpeg', new Set(['.jpg', '.jpeg'])],
+    ['image/png', new Set(['.png'])],
+    ['image/webp', new Set(['.webp'])],
+    ['image/gif', new Set(['.gif'])],
+  ]);
+  if (!allowed.has(mime) || !allowed.get(mime).has(ext)) {
+    return cb(Object.assign(new Error('Formato de imagen no permitido. Usa JPG, PNG, WEBP o GIF.'), { httpStatus: 400, code: 'IMAGEN_TIPO_INVALIDO' }));
+  }
+  cb(null, true);
+}
+
+const imageLimits = { fileSize: Number(process.env.PRODUCT_IMAGE_MAX_MB || 10) * 1024 * 1024, files: 3 };
+
 const imageUpload = multer({
   storage: imageStorage,
-  limits: { fileSize: Number(process.env.PRODUCT_IMAGE_MAX_MB || 10) * 1024 * 1024, files: 3 },
-  fileFilter: (_req, file, cb) => {
-    const mime = String(file.mimetype || '').toLowerCase();
-    const ext = path.extname(file.originalname || '').toLowerCase();
-    const allowed = new Map([
-      ['image/jpeg', new Set(['.jpg', '.jpeg'])],
-      ['image/png', new Set(['.png'])],
-      ['image/webp', new Set(['.webp'])],
-      ['image/gif', new Set(['.gif'])],
-    ]);
-    if (!allowed.has(mime) || !allowed.get(mime).has(ext)) {
-      return cb(Object.assign(new Error('Formato de imagen no permitido. Usa JPG, PNG, WEBP o GIF.'), { httpStatus: 400, code: 'IMAGEN_TIPO_INVALIDO' }));
-    }
-    cb(null, true);
-  },
+  limits: imageLimits,
+  fileFilter: imageFileFilter,
+});
+
+// Para creación atómica: las imágenes permanecen en memoria hasta obtener el ID
+// del producto y se guardan junto con la transacción de base de datos.
+const createImageUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: imageLimits,
+  fileFilter: imageFileFilter,
 });
 
 const videoStorage = multer.diskStorage({
@@ -107,6 +119,7 @@ router.get('/web/productos/:id', asyncHandler(ctl.webProducto));
 router.use(requireAuth);
 router.get('/', asyncHandler(ctl.listar));
 router.post('/', requireRoles('ADMIN', 'VENDEDOR', 'GESTOR_WEB'), asyncHandler(ctl.crear));
+router.post('/crear-con-imagenes', requireRoles('ADMIN', 'VENDEDOR', 'GESTOR_WEB'), createImageUpload.array('images', 3), asyncHandler(ctl.crearConImagenes));
 router.get('/:id', asyncHandler(ctl.get));
 router.patch('/:id', requireRoles('ADMIN', 'VENDEDOR', 'GESTOR_WEB'), asyncHandler(ctl.actualizar));
 router.patch('/:id/estado', requireRoles('ADMIN'), asyncHandler(ctl.estado));

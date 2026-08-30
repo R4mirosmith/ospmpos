@@ -91,8 +91,11 @@ async function get(req, res) {
 async function crear(req, res) {
   const { categoria_id, codigo, nombre, descripcion = '', garantia_info = null, costo = null, costo_promedio = null, precio = 0, precio_m = null, stock_minimo = 0, costoInicial = null, codigo_barras = null } = req.body || {};
   if (!categoria_id || !codigo || !nombre) return badRequest(res, 'categoria_id, codigo y nombre requeridos');
-  const s = await writeScope(req);
   const gestorWeb = esGestorWeb(req);
+  // Para GESTOR_WEB la creación debe pasar por el endpoint multipart, que garantiza
+  // al menos una imagen. Así no puede saltarse esa regla llamando el endpoint JSON.
+  if (gestorWeb) return badRequest(res, 'Debes crear el producto incluyendo al menos una imagen');
+  const s = await writeScope(req);
   // El gestor web puede crear el contenido del catálogo, pero nunca decide valores.
   // El backend fuerza todos los importes administrativos a cero aunque el cliente intente enviarlos.
   const cost = gestorWeb ? 0 : Number(costo ?? costo_promedio ?? costoInicial ?? 0);
@@ -120,7 +123,8 @@ async function crear(req, res) {
        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,UTC_TIMESTAMP())`,
       [s.empresa_id, s.sede_id, categoria_id, codigo, nombre, descripcion, garantia_info, cost, precioValor, precioMValor, stockMinimoValor, 1, codigo_barras || codigo]
     );
-    const initial = Number(req.body?.stock_inicial ?? req.body?.stock_actual ?? 0);
+    // GESTOR_WEB administra el catálogo, no el inventario. Al crear siempre inicia en 0.
+    const initial = gestorWeb ? 0 : Number(req.body?.stock_inicial ?? req.body?.stock_actual ?? 0);
     if (!Number.isFinite(initial) || initial < 0) {
       throw Object.assign(new Error('El stock inicial debe ser un valor válido no negativo'), { httpStatus: 400, code: 'STOCK_INICIAL_INVALIDO' });
     }
@@ -131,6 +135,94 @@ async function crear(req, res) {
     created(res, { id: r.insertId, message: 'Producto creado' });
   } catch (e) { await conn.rollback(); throw e; } finally { conn.release(); }
 }
+async function crearConImagenes(req, res) {
+  const files = Array.isArray(req.files) ? req.files : [];
+  if (files.length < 1) return badRequest(res, 'Debes cargar al menos una imagen para crear el producto');
+  if (files.length > 3) return badRequest(res, 'Máximo 3 imágenes por producto');
+
+  const {
+    categoria_id, codigo, nombre, descripcion = '', garantia_info = null,
+    costo = null, costo_promedio = null, precio = 0, precio_m = null,
+    stock_minimo = 0, costoInicial = null, codigo_barras = null,
+  } = req.body || {};
+  if (!categoria_id || !codigo || !nombre) return badRequest(res, 'categoria_id, codigo y nombre requeridos');
+
+  const scope = await writeScope(req);
+  const gestorWeb = esGestorWeb(req);
+  const cost = gestorWeb ? 0 : Number(costo ?? costo_promedio ?? costoInicial ?? 0);
+  const precioValor = gestorWeb ? 0 : Number(precio || 0);
+  const precioMValor = gestorWeb ? 0 : (precio_m === null || precio_m === undefined || precio_m === '' ? null : Number(precio_m));
+  const stockMinimoValor = Number(stock_minimo || 0);
+  const stockInicialValor = gestorWeb ? 0 : Number(req.body?.stock_inicial ?? req.body?.stock_actual ?? 0);
+
+  const valoresValidos = [cost, precioValor, stockMinimoValor, stockInicialValor, ...(precioMValor === null ? [] : [precioMValor])].every(Number.isFinite);
+  if (!valoresValidos || cost < 0 || precioValor < 0 || stockMinimoValor < 0 || stockInicialValor < 0 || (precioMValor !== null && precioMValor < 0)) {
+    return badRequest(res, 'Costo, precios y stock deben ser valores válidos no negativos');
+  }
+
+  const conn = await pool.getConnection();
+  const writtenFiles = [];
+  let productFolder = null;
+  try {
+    await conn.beginTransaction();
+
+    const [[categoria]] = await conn.query(
+      `SELECT id FROM categoria WHERE id=? AND sede_id=? AND activo=1 LIMIT 1`,
+      [Number(categoria_id), scope.sede_id]
+    );
+    if (!categoria) {
+      throw Object.assign(new Error('La categoría no pertenece a la sede activa o está inactiva'), { httpStatus: 400, code: 'CATEGORIA_INVALIDA' });
+    }
+
+    const [r] = await conn.query(
+      `INSERT INTO producto(empresa_id,sede_id,categoria_id,codigo,nombre,descripcion,garantia_info,costo,precio,precio_m,stock_minimo,activo,codigo_barras,fecha)
+       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,UTC_TIMESTAMP())`,
+      [scope.empresa_id, scope.sede_id, Number(categoria_id), codigo, nombre, descripcion, garantia_info || null, cost, precioValor, precioMValor, stockMinimoValor, 1, codigo_barras || codigo]
+    );
+    const productoId = Number(r.insertId);
+
+    if (stockInicialValor > 0) {
+      await conn.query(
+        `INSERT INTO inv_movimiento(empresa_id,sede_id,producto_id,usuario_id,tipo,cantidad,costo_unitario,comentario,fecha,activo)
+         VALUES(?,?,?,?,?,?,?,?,UTC_TIMESTAMP(),1)`,
+        [scope.empresa_id, scope.sede_id, productoId, req.user.id, 'IN_AJUSTE', stockInicialValor, cost, 'Stock inicial']
+      );
+    }
+
+    productFolder = path.resolve(config.uploads.dir, 'products', String(productoId));
+    fs.mkdirSync(productFolder, { recursive: true });
+    const uploaded = [];
+
+    for (let i = 0; i < files.length; i++) {
+      const f = files[i];
+      const safeOriginal = path.basename(String(f.originalname || `imagen-${i + 1}`)).replace(/[^a-zA-Z0-9._-]/g, '_');
+      const filename = `${Date.now()}-${i}-${safeOriginal}`;
+      const filePath = path.join(productFolder, filename);
+      fs.writeFileSync(filePath, f.buffer);
+      writtenFiles.push(filePath);
+
+      const publicPath = `/productos/${productoId}/imagenes/public/${filename}`;
+      const [imgResult] = await conn.query(
+        `INSERT INTO producto_imagen(producto_id,url,alt,es_principal,orden,fecha) VALUES(?,?,?,?,?,UTC_TIMESTAMP())`,
+        [productoId, publicPath, f.originalname || nombre, i === 0 ? 1 : 0, i]
+      );
+      uploaded.push({ id: imgResult.insertId, url: publicPath, es_principal: i === 0 ? 1 : 0, orden: i });
+    }
+
+    await conn.commit();
+    created(res, { id: productoId, message: 'Producto creado', uploaded, items: uploaded });
+  } catch (e) {
+    await conn.rollback();
+    for (const filePath of writtenFiles) borrarArchivoSilencioso(filePath);
+    if (productFolder) {
+      try { fs.rmdirSync(productFolder); } catch { /* puede no estar vacío o ya no existir */ }
+    }
+    throw e;
+  } finally {
+    conn.release();
+  }
+}
+
 async function actualizar(req, res) {
   const id = Number(req.params.id);
   const body = { ...(req.body || {}) };
@@ -436,4 +528,4 @@ async function publicProducto(req, res) {
   );
   ok(res, rows[0] || null);
 }
-module.exports = { listar, get, crear, actualizar, estado, cambiarEstado: estado, imgAgregar, imgListar, imgSetPrincipal, imgReordenar, imgEliminar, imgUpload, videoUpload, videoEliminar, webCatalogo, webProducto, publicCatalogo, publicProducto };
+module.exports = { listar, get, crear, crearConImagenes, actualizar, estado, cambiarEstado: estado, imgAgregar, imgListar, imgSetPrincipal, imgReordenar, imgEliminar, imgUpload, videoUpload, videoEliminar, webCatalogo, webProducto, publicCatalogo, publicProducto };
