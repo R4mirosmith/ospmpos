@@ -6,6 +6,7 @@ const ctl = require('../controllers/public.controller');
 router.get('/categories', asyncHandler(ctl.categories));
 router.get('/products', asyncHandler(ctl.products));
 router.get('/products/:id', asyncHandler(ctl.productDetail));
+router.get('/settings', asyncHandler(ctl.settings));
 router.post('/orders/delivery', asyncHandler(ctl.createDeliveryOrder));
 
 module.exports = router;

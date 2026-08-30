@@ -26,11 +26,12 @@ function gestorWebScope(req, res, next) {
   const allowed =
     route.startsWith('/api/productos') ||
     route.startsWith('/api/pedidos-web') ||
+    route.startsWith('/api/tienda-config') ||
     route.startsWith('/api/public') ||
     (route.startsWith('/api/categorias') && method === 'GET');
 
   if (!allowed) {
-    return forbidden(res, 'Este rol solo puede acceder a productos, pedidos web y notificaciones asociadas a la tienda.');
+    return forbidden(res, 'Este rol solo puede acceder a productos, pedidos web, configuración visual y notificaciones asociadas a la tienda.');
   }
 
   return next();

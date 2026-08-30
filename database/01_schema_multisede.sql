@@ -2,7 +2,7 @@ CREATE DATABASE IF NOT EXISTS inletshop_multisede CHARACTER SET utf8mb4 COLLATE 
 USE inletshop_multisede;
 
 SET FOREIGN_KEY_CHECKS=0;
-DROP TABLE IF EXISTS notificacion_config, pedidos_web_detalle, pedidos_web, deduccion, deduccion_concepto, devolucion_venta_detalle, devolucion_venta, venta_pago, venta_detalle, venta, compra_detalle, compra, inv_movimiento, producto_imagen, producto, servicio, proveedor, cliente, categoria, usuario_sede, usuario, sede, empresa, usuario_tipo;
+DROP TABLE IF EXISTS tienda_configuracion, notificacion_config, pedidos_web_detalle, pedidos_web, deduccion, deduccion_concepto, devolucion_venta_detalle, devolucion_venta, venta_pago, venta_detalle, venta, compra_detalle, compra, inv_movimiento, producto_imagen, producto, servicio, proveedor, cliente, categoria, usuario_sede, usuario, sede, empresa, usuario_tipo;
 SET FOREIGN_KEY_CHECKS=1;
 
 CREATE TABLE usuario_tipo (
@@ -39,6 +39,24 @@ CREATE TABLE sede (
   fecha_creacion DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
   KEY idx_sede_empresa (empresa_id),
   CONSTRAINT fk_sede_empresa FOREIGN KEY (empresa_id) REFERENCES empresa(id)
+ ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE tienda_configuracion (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  empresa_id INT NOT NULL,
+  sede_id INT NOT NULL,
+  logo_url TEXT NULL,
+  color_primario VARCHAR(7) NOT NULL DEFAULT '#050505',
+  color_secundario VARCHAR(7) NOT NULL DEFAULT '#FFFFFF',
+  color_acento VARCHAR(7) NOT NULL DEFAULT '#10B981',
+  color_fondo VARCHAR(7) NOT NULL DEFAULT '#F8FAFC',
+  color_texto VARCHAR(7) NOT NULL DEFAULT '#0F172A',
+  fuente VARCHAR(30) NOT NULL DEFAULT 'INTER',
+  fecha_actualizacion DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE KEY uq_tienda_config_sede (sede_id),
+  KEY idx_tienda_config_empresa (empresa_id),
+  CONSTRAINT fk_tienda_config_empresa FOREIGN KEY (empresa_id) REFERENCES empresa(id),
+  CONSTRAINT fk_tienda_config_sede FOREIGN KEY (sede_id) REFERENCES sede(id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE usuario (

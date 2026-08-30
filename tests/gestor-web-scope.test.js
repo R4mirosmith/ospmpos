@@ -45,6 +45,9 @@ assert.strictEqual(run('PATCH', '/api/pedidos-web/1/estado', 'GESTOR_WEB').nextC
 assert.strictEqual(run('POST', '/api/pedidos-web/1/facturar', 'GESTOR_WEB').nextCalled, true);
 assert.strictEqual(run('GET', '/api/pedidos-web/ventas-realizadas', 'GESTOR_WEB').nextCalled, true);
 assert.strictEqual(run('GET', '/api/categorias', 'GESTOR_WEB').nextCalled, true);
+assert.strictEqual(run('GET', '/api/tienda-config', 'GESTOR_WEB').nextCalled, true);
+assert.strictEqual(run('PATCH', '/api/tienda-config', 'GESTOR_WEB').nextCalled, true);
+assert.strictEqual(run('POST', '/api/tienda-config/logo', 'GESTOR_WEB').nextCalled, true);
 
 let r = run('POST', '/api/categorias', 'GESTOR_WEB');
 assert.strictEqual(r.nextCalled, false);

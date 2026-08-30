@@ -48,6 +48,7 @@ app.use('/api/reportes', require('./routes/reportes.routes'));
 app.use('/api/deducciones', require('./routes/deducciones.routes'));
 app.use('/api/pedidos-web', require('./routes/pedidosWeb.routes'));
 app.use('/api/notificaciones', require('./routes/notificaciones.routes'));
+app.use('/api/tienda-config', require('./routes/tiendaConfig.routes'));
 app.use('/api/public', require('./routes/public.routes'));
 
 app.use((req, res) => res.status(404).json({ success: 0, status: 'NOT_FOUND', result: { message: 'Ruta no encontrada' } }));

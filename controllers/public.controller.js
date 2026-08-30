@@ -3,6 +3,7 @@ const { ok, created, badRequest } = require('../utils/http');
 const { emitPedidoWebNuevo } = require('../realtime');
 const config = require('../config');
 const { attachProductImages } = require('../utils/productFields');
+const { publicShape } = require('./tiendaConfig.controller');
 
 function publicSedeId(req) {
   return Number(req.query.sede_id || config.public.defaultSedeId);
@@ -114,6 +115,25 @@ async function productDetail(req, res) {
   ok(res, enriched[0] || null);
 }
 
+
+async function settings(req, res) {
+  const sedeId = publicSedeId(req);
+  const [[sede]] = await pool.query(
+    `SELECT s.id,s.empresa_id,s.nombre,s.logo_url
+       FROM sede s
+       JOIN empresa e ON e.id=s.empresa_id
+      WHERE s.id=? AND s.activo=1 AND e.activo=1
+      LIMIT 1`,
+    [sedeId]
+  );
+  if (!sede) return badRequest(res, 'Sede pública no configurada');
+  const [[row]] = await pool.query(
+    `SELECT * FROM tienda_configuracion WHERE sede_id=? LIMIT 1`,
+    [sedeId]
+  );
+  ok(res, publicShape(row || null, sede));
+}
+
 // IMPORTANTE: se conserva el flujo estable de creación + Socket.IO sin cambios funcionales.
 async function createDeliveryOrder(req, res) {
   const body = req.body || {};
@@ -218,4 +238,4 @@ async function createDeliveryOrder(req, res) {
   }
 }
 
-module.exports={categories,products,productDetail,createDeliveryOrder};
+module.exports={categories,products,productDetail,settings,createDeliveryOrder};
